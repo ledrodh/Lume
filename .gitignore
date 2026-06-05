@@ -1,0 +1,35 @@
+# ==========================================
+# .gitignore para Ebook Restorer Pro
+# ==========================================
+
+# 1. Pastas de Saída e Processamento (NÃO subir PDFs ou Ebooks gerados)
+Restored_Output/
+workdir/
+marker_input/
+*.pdf
+*.epub
+*.azw3
+*.jpg
+*.jpeg
+*.png
+*.log
+process_log.txt
+
+# 2. Arquivos de Cache do Python (Lixo de compilação)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 3. Ambientes Virtuais (Nunca se sobe o venv para o GitHub)
+venv/
+.venv/
+env/
+
+# 4. Arquivos Temporários e de Sistema Operativo
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# 5. Configurações de Editores de Código (VS Code, PyCharm, etc.)
+.vscode/
+.idea/
