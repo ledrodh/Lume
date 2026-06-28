@@ -1,4 +1,3 @@
- core/converter.py
 import os 
 import re 
 import shutil 
@@ -61,53 +60,77 @@ def _sanitize_name(text: str, fallback: str = "Book") -> str:
 # ───────────────────────────────────────────────────────────────────────────── 
  
 def process_book(pdf_in: str, out_dir: str, title: str, author: str, 
-                 formats: list, start_page: int = 1): 
+                 formats: list, start_page: int = 1, max_pages: int = None): 
      
     if not title or not title.strip(): 
         title = os.path.splitext(os.path.basename(pdf_in))[0] 
      
     if not author or not author.strip(): 
         author = "Unknown" 
- 
+
     pdf_in = os.path.abspath(pdf_in) 
     out_dir = os.path.abspath(out_dir) 
     work_dir = os.path.join(out_dir, "workdir") 
     marker_in_dir = os.path.join(work_dir, "marker_input") 
     log_path = os.path.join(out_dir, "process_log.txt") 
- 
+
     if os.path.exists(work_dir): shutil.rmtree(work_dir) 
     os.makedirs(marker_in_dir, exist_ok=True) 
     os.makedirs(out_dir, exist_ok=True) 
- 
+
     if os.path.exists(log_path): os.remove(log_path) 
     log = lambda msg: _log(log_path, msg) 
- 
-    # 1. Extraction 
+
+    # 1. Extração da Capa e Conteúdo Base
     content_pdf = os.path.join(marker_in_dir, "content.pdf") 
     cover_jpg = os.path.join(work_dir, "cover.jpg") 
     extract_cover_and_content(pdf_in, cover_jpg, content_pdf, start_page, log_path) 
- 
+    
+
+    if max_pages is not None:
+        log(f"🧪 Modo de Teste Ativo: Limitando o documento a {max_pages} páginas para economizar processamento.")
+        import fitz
+        doc = fitz.open(content_pdf)
+        if doc.page_count > max_pages:
+            doc.select(range(max_pages))  # Retém estritamente as primeiras N páginas (0 até max_pages-1)
+            temp_limited_pdf = content_pdf + ".tmp"
+            doc.save(temp_limited_pdf, garbage=3, deflate=True)
+            doc.close()
+            os.replace(temp_limited_pdf, content_pdf)  # Substitui o PDF temporário pelo reduzido
+        else:
+            doc.close()
+
     # 2. OCR (GPU) 
     env = os.environ.copy() 
     env["TORCH_DEVICE"] = "cuda" 
+    
+    env["TF_ENABLE_ONEDNN_OPTS"] = "0" 
+    env["TF_CPP_MIN_LOG_LEVEL"] = "2" 
+
     log("🔍 Running OCR via Marker (GPU)...") 
      
-    res_marker = subprocess.run(["marker", marker_in_dir, "--output_dir", work_dir],  
-                                capture_output=True, text=True, env=env) 
+    res_marker = subprocess.run(
+        ["marker", marker_in_dir, "--output_dir", work_dir],  
+        capture_output=True, 
+        text=True, 
+        env=env
+    ) 
      
     if res_marker.returncode != 0: 
-        raise Exception(f"Marker failed:\n{res_marker.stderr[:800]}") 
- 
+        # Captura os últimos 1500 caracteres para garantir que pegamos o erro real (Traceback)
+        error_msg = res_marker.stderr[-1500:] if len(res_marker.stderr) > 1500 else res_marker.stderr
+        raise Exception(f"Marker failed:\n[...]\n{error_msg}")
+
     # 3. MD File Localization 
     md_path = _find_generated_md(work_dir) 
     if not md_path: 
         raise Exception("Marker finished, but did not generate a Markdown file. Check if the PDF is not just blank images or if it has DRM protection.") 
- 
+
     # 4. Sanitization and Pandoc 
     with open(md_path, 'r', encoding='utf-8') as f: md_text = f.read() 
     md_text = re.sub(r'\s(id|name)=["\'][^"\']+["\']', '', md_text) 
     with open(md_path, 'w', encoding='utf-8') as f: f.write(md_text) 
- 
+
     log("📦 Generating base EPUB with Pandoc...") 
     temp_epub = os.path.join(os.path.dirname(md_path), "temp.epub") 
      
@@ -115,23 +138,29 @@ def process_book(pdf_in: str, out_dir: str, title: str, author: str,
         pandoc_exe = pypandoc.get_pandoc_path() 
     except: 
         pandoc_exe = "pandoc" 
- 
+
     pandoc_cmd = [pandoc_exe, md_path, "-o", temp_epub] 
     if os.path.exists(cover_jpg): 
         pandoc_cmd += ["--epub-cover-image", cover_jpg] 
      
     pandoc_cmd += ["-M", f"title={title}", "-M", f"author={author}"] 
      
-    subprocess.run(pandoc_cmd, check=True, capture_output=True, text=True) 
- 
+    subprocess.run(
+        pandoc_cmd, 
+        check=True, 
+        capture_output=True, 
+        text=True,
+        cwd=os.path.dirname(md_path) 
+    ) 
+
     # 5. HTML Healing 
     base_name = _sanitize_name(title) 
     epub_final = os.path.join(out_dir, f"{base_name}.epub") 
     process_epub_html(temp_epub, epub_final, log_path) 
- 
+
     # 6. Conversions (Robust Calibre) 
     calibre_path = CALIBRE_EXE 
- 
+
     for fmt in formats: 
         if fmt in ["AZW3", "PDF"]: 
             out_file = os.path.join(out_dir, f"{base_name}.{fmt.lower()}") 
@@ -141,5 +170,5 @@ def process_book(pdf_in: str, out_dir: str, title: str, author: str,
                 log(f"✅ Generated: {out_file}") 
             except Exception as e: 
                 log(f"⚠ Conversion error {fmt}: {str(e)}") 
- 
+
     log("🎉 Restoration complete!")
