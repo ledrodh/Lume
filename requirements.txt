@@ -1,21 +1,25 @@
 # ==========================================
-# Lume  - Dependencies
+# Lume - Dependencies
 # ==========================================
 
-# OCR Engine
-marker-pdf>=0.3.0
+# Layout Analysis & OCR Engine (Marker 1.x API)
+marker-pdf>=1.0.0,<2.0.0
 
-# PDF Manipulation (Cover and Content Extraction)
-PyMuPDF>=1.23.0
+# PDF Manipulation (Cover, CMap Sanitization & Content Extraction)
+PyMuPDF>=1.24.0,<2.0.0
 
-# HTML Cleaning and Reconstruction (Healer)
-beautifulsoup4>=4.12.0
+# HTML Cleaning and Structural Reconstruction (Healer)
+beautifulsoup4>=4.12.0,<5.0.0
 
-# Communication with the Pandoc compiler
-pypandoc>=1.12
+# Pandoc Wrapper for Base EPUB Compilation
+pypandoc>=1.13,<2.0.0
 
-# NOTE ON PYTORCH (CUDA):
-# PyTorch is intentionally omitted from this list to prevent
-# 'pip' from installing the default CPU version. 
-# For NVIDIA GPU support, install PyTorch manually using:
+# Automated Test Suite
+pytest>=8.0.0,<9.0.0
+
+# NOTE ON PYTORCH (CUDA / GPU ACCELERATION):
+# PyTorch is intentionally omitted from this file to prevent pip from
+# overwriting a CUDA build with the default CPU-only wheel.
+# Lume automatically detects CUDA, Apple MPS, or CPU at runtime.
+# For NVIDIA GPU acceleration, install PyTorch manually before marker-pdf:
 # pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121

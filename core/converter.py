@@ -1,20 +1,26 @@
-import sys
 import os
 import re
 import shutil
-import tempfile
 import subprocess
-import pypandoc
-import fitz
+import sys
+import tempfile
 from pathlib import Path
 
-from core.pdf_handler import extract_cover_and_content, is_born_digital_pdf
+import fitz
+import pypandoc
+
 from core.html_healer import process_epub_html
+from core.pdf_handler import (
+    extract_cover_and_content,
+    extract_pdf_metadata,
+    is_born_digital_pdf,
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM SETTINGS
 # ─────────────────────────────────────────────────────────────────────────────
-def get_calibre_path():
+def get_calibre_path() -> str:
     path = shutil.which("ebook-convert")
     if path:
         return path
@@ -24,7 +30,7 @@ def get_calibre_path():
         r"C:\Program Files (x86)\Calibre2\ebook-convert.exe",
         "/usr/bin/ebook-convert",
         "/usr/local/bin/ebook-convert",
-        "/Applications/calibre.app/Contents/MacOS/ebook-convert"
+        "/Applications/calibre.app/Contents/MacOS/ebook-convert",
     ]
     for p in common_paths:
         if os.path.exists(p):
@@ -35,15 +41,15 @@ def get_calibre_path():
 CALIBRE_EXE = get_calibre_path()
 
 
-def get_marker_path():
+def get_marker_path() -> str:
     exe_name = "marker_single.exe" if os.name == "nt" else "marker_single"
-    # 1. Pasta Scripts do mesmo interpretador Python que está rodando este script
+    # 1. Scripts directory of the active Python interpreter
     venv_scripts = Path(sys.executable).parent
     candidate = venv_scripts / exe_name
     if candidate.exists():
         return str(candidate)
 
-    # 2. Ambientes virtuais locais do projeto (caso o script tenha sido iniciado pelo Python global)
+    # 2. Local project virtual environments (in case the app was launched via global Python)
     here = Path(__file__).resolve()
     for parent in [here.parents[1], here.parents[2]]:
         for venv_dir in ["venv", ".venv"]:
@@ -51,7 +57,7 @@ def get_marker_path():
             if cand.exists():
                 return str(cand)
 
-    # 3. PATH do sistema
+    # 3. System PATH
     path = shutil.which("marker_single")
     if path:
         return path
@@ -62,8 +68,8 @@ def get_marker_path():
 MARKER_EXE = get_marker_path()
 
 
-def get_marker_python():
-    """Retorna o executável Python do ambiente onde o Marker está instalado."""
+def get_marker_python() -> str:
+    """Returns the Python executable from the environment where Marker is installed."""
     marker_path = Path(MARKER_EXE)
     if marker_path.exists():
         py_name = "python.exe" if os.name == "nt" else "python"
@@ -73,17 +79,46 @@ def get_marker_python():
     return sys.executable
 
 
+def _detect_compute_device(marker_py: str) -> str:
+    """
+    Detects the optimal compute device ('cuda', 'mps', or 'cpu') available in the
+    target Python environment, respecting an explicit LUME_DEVICE override if set.
+    """
+    override = os.environ.get("LUME_DEVICE", "").strip().lower()
+    if override in {"cuda", "mps", "cpu"}:
+        return override
+
+    probe_code = (
+        "import torch; "
+        "print('cuda' if torch.cuda.is_available() else "
+        "('mps' if getattr(torch.backends, 'mps', None) and torch.backends.mps.is_available() else 'cpu'))"
+    )
+    try:
+        res = subprocess.run(
+            [marker_py, "-c", probe_code],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        detected = res.stdout.strip().splitlines()[-1].strip() if res.returncode == 0 and res.stdout.strip() else "cpu"
+        if detected in {"cuda", "mps", "cpu"}:
+            return detected
+    except Exception:
+        pass
+    return "cpu"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # UTILS
 # ─────────────────────────────────────────────────────────────────────────────
-
 def _log(log_path: str, msg: str):
-    with open(log_path, 'a', encoding='utf-8') as f:
-        f.write(msg + '\n')
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(msg + "\n")
     try:
         print(msg)
     except UnicodeEncodeError:
-        print(msg.encode(sys.stdout.encoding or 'utf-8', errors='replace').decode(sys.stdout.encoding or 'utf-8', errors='replace'))
+        enc = sys.stdout.encoding or "utf-8"
+        print(msg.encode(enc, errors="replace").decode(enc, errors="replace"))
 
 
 def _find_generated_md(work_dir: str) -> str | None:
@@ -93,7 +128,7 @@ def _find_generated_md(work_dir: str) -> str | None:
     for c in candidates:
         if c.exists():
             return str(c)
-    all_files = [p for p in work.rglob("*.md") if '_meta' not in p.name and p.is_file()]
+    all_files = [p for p in work.rglob("*.md") if "_meta" not in p.name and p.is_file()]
     if all_files:
         all_files.sort(key=lambda p: len(p.parts))
         return str(all_files[0])
@@ -101,32 +136,32 @@ def _find_generated_md(work_dir: str) -> str | None:
 
 
 def _sanitize_name(text: str, fallback: str = "Book") -> str:
-    name = re.sub(r'[^\w\s\-]', '', text or '').strip()
-    return name.replace(' ', '_') or fallback
+    name = re.sub(r"[^\w\s\-]", "", text or "").strip()
+    return name.replace(" ", "_") or fallback
 
 
 def _sanitize_markdown(md_text: str, pdf_path: str | None = None) -> str:
     """
-    Prepara o Markdown gerado pelo Marker antes da compilação com Pandoc:
-    - Remove atributos id/name inválidos
-    - Corrige tags <sup>&</sup>lt;sup>N</sup> corrompidas pelo OCR
-    - Normaliza travessões corrompidos pela fonte Symbol ('⎯\uf8e7' ou ' ! ')
-    - Converte números de seção isolados ('\n\n2.\n\n') em subtítulos '### 2.' (evitando listas vazias <ol><li></li></ol>)
-    - Recupera números de seção isolados sem ponto ('\n\n53\n\n') ou suprimidos no rodapé de página ('67.')
-    - Escapa números seguidos de ponto no início de parágrafo ('44. Texto' -> '44\\. Texto') para o Pandoc não destruir a numeração
+    Prepares the Markdown generated by Marker before compiling with Pandoc:
+    - Removes invalid id/name attributes
+    - Repairs OCR-corrupted <sup>&</sup>lt;sup>N</sup> tags
+    - Normalizes Symbol font em-dashes ('⎯\uf8e7' or isolated ' ! ')
+    - Converts standalone section numbers ('\n\n2.\n\n') into '### 2.' headings (avoiding empty <ol> lists)
+    - Recovers standalone section numbers printed without a period ('53') or dropped at page footers ('67.')
+    - Escapes paragraph-initial numbers ('44. Text' -> '44\\. Text') so Pandoc preserves original numbering
     """
-    md_text = re.sub(r'\s(id|name)=["\'][^"\']+["\']', '', md_text)
-    md_text = re.sub(r'<sup>\s*&(?:amp;)?\s*</sup>\s*lt;sup>\s*(\d+)\s*</sup>', r'<sup>\1</sup>', md_text)
-    md_text = md_text.replace('\u23af\uf8e7', '—').replace('\uf8e7', '—').replace('\u23af', '—')
-    # Caso o pypdfium2 tenha extraído travessão Symbol como ' ! ' entre palavras/vírgulas
-    md_text = re.sub(r'(?<=\s)!(?=\s|[,\.;:])', '—', md_text)
-    md_text = re.sub(r'(?m)^!\s+', '— ', md_text)
-    # Números de seção isolados em sua própria linha (ex.: "1.", "2.", ..., "80.") -> subtítulo H3 centralizado
-    md_text = re.sub(r'(?m)^(\d{1,3})\.\s*$', r'### \1.', md_text)
+    md_text = re.sub(r'\s(id|name)=["\'][^"\']+["\']', "", md_text)
+    md_text = re.sub(r"<sup>\s*&(?:amp;)?\s*</sup>\s*lt;sup>\s*(\d+)\s*</sup>", r"<sup>\1</sup>", md_text)
+    md_text = md_text.replace("\u23af\uf8e7", "—").replace("\uf8e7", "—").replace("\u23af", "—")
+    # Handle cases where pypdfium2 extracted a Symbol em-dash as ' ! ' between words/clauses
+    md_text = re.sub(r"(?<=\s)!(?=\s|[,\.;:])", "—", md_text)
+    md_text = re.sub(r"(?m)^!\s+", "— ", md_text)
+    # Standalone section numbers on their own line (e.g., "1.", "2.", ..., "80.") -> centered H3 heading
+    md_text = re.sub(r"(?m)^(\d{1,3})\.\s*$", r"### \1.", md_text)
 
-    # Verifica se há números de seção sequenciais faltando (ex.: impressos sem ponto "53" ou no fim de página "67.")
-    # Itera de trás para frente para não deslocar os índices de match ao modificar md_text
-    sec_matches = list(re.finditer(r'(?m)^###\s+(\d{1,3})\.\s*$', md_text))
+    # Recover sequential section numbers missing due to omitted periods ("53") or page-footer filtering ("67.")
+    # Iterate in reverse order to preserve match offsets when modifying md_text
+    sec_matches = list(re.finditer(r"(?m)^###\s+(\d{1,3})\.\s*$", md_text))
     if len(sec_matches) >= 2:
         for idx in range(len(sec_matches) - 2, -1, -1):
             curr_num = int(sec_matches[idx].group(1))
@@ -136,23 +171,22 @@ def _sanitize_markdown(md_text: str, pdf_path: str | None = None) -> str:
                 span_start = sec_matches[idx].end()
                 span_end = sec_matches[idx + 1].start()
                 segment = md_text[span_start:span_end]
-                # Caso 1: O número da seção está isolado numa linha sem ponto final (ex.: "\n\n53\n\n")
+                # Case 1: The section number is on its own line without a period (e.g., "\n\n53\n\n")
                 seg_fixed, count = re.subn(
-                    rf'(?m)^[ \t]*{missing_num}[ \t]*$',
-                    f'### {missing_num}.',
+                    rf"(?m)^[ \t]*{missing_num}[ \t]*$",
+                    f"### {missing_num}.",
                     segment,
-                    count=1
+                    count=1,
                 )
                 if count > 0:
                     md_text = md_text[:span_start] + seg_fixed + md_text[span_end:]
                 elif pdf_path and os.path.exists(pdf_path):
-                    # Caso 2: O número da seção ("67.") ficava na última linha da página do PDF e foi filtrado como rodapé
+                    # Case 2: The section number ("67.") was on the last line of a PDF page and filtered as a footer
                     try:
-                        import fitz
                         doc = fitz.open(pdf_path)
                         for page in doc:
                             lines = [l.strip() for l in page.get_text().splitlines() if l.strip()]
-                            if len(lines) >= 2 and re.match(rf'^{missing_num}\.?$', lines[-1]):
+                            if len(lines) >= 2 and re.match(rf"^{missing_num}\.?$", lines[-1]):
                                 anchor = lines[-2][-35:].strip()
                                 if anchor and anchor in segment:
                                     pos = segment.find(anchor) + len(anchor)
@@ -163,10 +197,10 @@ def _sanitize_markdown(md_text: str, pdf_path: str | None = None) -> str:
                     except Exception:
                         pass
 
-    # Garante linha em branco antes e depois de cada subtítulo ### N. para o Pandoc
-    md_text = re.sub(r'\n*(### \d{1,3}\.)\n*', r'\n\n\1\n\n', md_text)
-    # Evita que o Pandoc transforme parágrafos numerados (ex.: na Sinopse "44. Chamamos técnica...") em listas <ol> renumeradas
-    md_text = re.sub(r'(?m)^(\d{1,3})\.\s+(?=\S)', r'\1\. ', md_text)
+    # Ensure a blank line before and after each ### N. heading for Pandoc
+    md_text = re.sub(r"\n*(### \d{1,3}\.)\n*", r"\n\n\1\n\n", md_text)
+    # Prevent Pandoc from turning numbered paragraphs (e.g., Synopsis "44. Text...") into renumbered <ol> lists
+    md_text = re.sub(r"(?m)^(\d{1,3})\.\s+(?=\S)", r"\1\. ", md_text)
     return md_text
 
 
@@ -246,18 +280,24 @@ log(f"-> All {total_pages} pages successfully converted to Markdown.")
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN FUNCTION
 # ─────────────────────────────────────────────────────────────────────────────
-
-def process_book(pdf_in: str, out_dir: str, title: str, author: str,
-                 formats: list, start_page: int = 1):
-
-    if not title or not title.strip():
-        title = os.path.splitext(os.path.basename(pdf_in))[0]
-
-    if not author or not author.strip():
-        author = "Unknown"
-
+def process_book(
+    pdf_in: str,
+    out_dir: str,
+    title: str,
+    author: str,
+    formats: list,
+    start_page: int = 1,
+) -> dict:
     pdf_in = os.path.abspath(pdf_in)
     out_dir = os.path.abspath(out_dir)
+
+    embedded_meta = extract_pdf_metadata(pdf_in)
+    if not title or not title.strip():
+        title = embedded_meta.get("title") or os.path.splitext(os.path.basename(pdf_in))[0]
+
+    if not author or not author.strip():
+        author = embedded_meta.get("author") or "Unknown"
+
     work_dir = os.path.join(out_dir, "workdir")
     marker_in_dir = os.path.join(work_dir, "marker_input")
     log_path = os.path.join(out_dir, "process_log.txt")
@@ -271,18 +311,21 @@ def process_book(pdf_in: str, out_dir: str, title: str, author: str,
         os.remove(log_path)
     log = lambda msg: _log(log_path, msg)
 
-    # 1. Extraction
+    # 1. Cover & Content Extraction
     content_pdf = os.path.join(marker_in_dir, "content.pdf")
     cover_jpg = os.path.join(work_dir, "cover.jpg")
     extract_cover_and_content(pdf_in, cover_jpg, content_pdf, start_page, log_path)
 
-    # 2. OCR / Layout Extraction (GPU, Chunked to avoid ArrayMemoryError on large books)
+    # 2. OCR / Layout Extraction (Chunked to avoid ArrayMemoryError on large books)
+    marker_py = get_marker_python()
+    compute_device = _detect_compute_device(marker_py)
+
     env = os.environ.copy()
-    env["TORCH_DEVICE"] = "cuda"
+    env["TORCH_DEVICE"] = compute_device
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUTF8"] = "1"
 
-    # Bloqueio agressivo do vLLM/Docker para todos os submódulos
+    # Enforce native PyTorch backend across all Marker/Surya submodules
     env["INFERENCE_BACKEND"] = "torch"
     env["SURYA_INFERENCE_BACKEND"] = "torch"
     env["MARKER_INFERENCE_BACKEND"] = "torch"
@@ -296,8 +339,7 @@ def process_book(pdf_in: str, out_dir: str, title: str, author: str,
     if disable_ocr_flag == "1":
         log("📄 Native digital text layer detected -> enabling --disable_ocr for 100% text fidelity and 3x speed.")
 
-    marker_py = get_marker_python()
-    log("🔍 Running Marker in memory-safe 50-page chunks (GPU com PyTorch Nativo)...")
+    log(f"🔍 Running Marker in memory-safe 50-page chunks (device: {compute_device.upper()}, native PyTorch)...")
     log(f"-> Python/Marker environment resolved at: {marker_py}")
 
     try:
@@ -307,30 +349,33 @@ def process_book(pdf_in: str, out_dir: str, title: str, author: str,
             text=True,
             encoding="utf-8",
             errors="replace",
-            env=env
+            env=env,
         )
     except FileNotFoundError as e:
-        log(f"CRITICAL: não foi possível localizar/executar o Python do Marker.\nCaminho tentado: {marker_py}\nErro: {e}")
-        raise Exception(
-            f"O ambiente Python do Marker não foi encontrado.\n"
-            f"Caminho tentado: {marker_py}"
-        )
+        log(f"CRITICAL: Could not locate or execute the Marker Python environment.\nAttempted path: {marker_py}\nError: {e}")
+        raise RuntimeError(
+            f"The Marker Python environment was not found.\n"
+            f"Attempted path: {marker_py}"
+        ) from e
 
     if res_marker.returncode != 0:
         log(f"CRITICAL MARKER ERROR:\n{res_marker.stderr}")
         error_tail = res_marker.stderr.strip()[-1000:]
-        raise Exception(f"Marker failed! See process_log.txt.\nEnd of error:\n{error_tail}")
+        raise RuntimeError(f"Marker failed! See process_log.txt.\nEnd of error:\n{error_tail}")
 
-    # 3. MD File Localization
+    # 3. Locate Generated Markdown
     md_path = _find_generated_md(work_dir)
     if not md_path:
-        raise Exception("Marker finished, but did not generate a Markdown file. Check if the PDF is not just blank images or if it has DRM protection.")
+        raise RuntimeError(
+            "Marker finished, but did not generate a Markdown file. "
+            "Check if the PDF consists only of blank images or has DRM protection."
+        )
 
-    # 4. Sanitization and Pandoc
-    with open(md_path, 'r', encoding='utf-8') as f:
+    # 4. Markdown Sanitization and Base EPUB Compilation via Pandoc
+    with open(md_path, "r", encoding="utf-8") as f:
         md_text = f.read()
     md_text = _sanitize_markdown(md_text, content_pdf_path)
-    with open(md_path, 'w', encoding='utf-8') as f:
+    with open(md_path, "w", encoding="utf-8") as f:
         f.write(md_text)
 
     log("📦 Generating base EPUB with Pandoc...")
@@ -354,19 +399,26 @@ def process_book(pdf_in: str, out_dir: str, title: str, author: str,
         text=True,
         encoding="utf-8",
         errors="replace",
-        cwd=os.path.dirname(md_path)
+        cwd=os.path.dirname(md_path),
     )
 
-    # 5. HTML Healing
+    # 5. HTML Healing & OCF Packaging
     base_name = _sanitize_name(title)
     epub_final = os.path.join(out_dir, f"{base_name}.epub")
     process_epub_html(temp_epub, epub_final, log_path)
 
-    # 6. Conversions (Robust Calibre — usa arquivo temporário para stdout/stderr em vez de PIPE
-    # para evitar que subprocessos órfãos do QtWebEngine/Chromium bloqueiem o fechamento do pipe no Windows)
+    requested_formats = [f.upper() for f in formats]
+    generated_files = []
+    failed_formats = {}
+
+    if "EPUB" in requested_formats:
+        generated_files.append(epub_final)
+
+    # 6. Additional Format Conversions via Calibre (uses temporary files for stdout/stderr instead of PIPE
+    # so detached QtWebEngine/Chromium helper processes never block pipe closure on Windows)
     calibre_path = CALIBRE_EXE
 
-    for fmt in formats:
+    for fmt in requested_formats:
         if fmt in ["AZW3", "PDF"]:
             out_file = os.path.join(out_dir, f"{base_name}.{fmt.lower()}")
             log(f"📱 Converting to {fmt}...")
@@ -378,10 +430,32 @@ def process_book(pdf_in: str, out_dir: str, title: str, author: str,
                         stdin=subprocess.DEVNULL,
                         stdout=out_f,
                         stderr=err_f,
-                        timeout=600
+                        timeout=600,
                     )
+                generated_files.append(out_file)
                 log(f"✅ Generated: {out_file}")
             except Exception as e:
-                log(f"⚠ Conversion error {fmt}: {str(e)}")
+                failed_formats[fmt] = str(e)
+                log(f"⚠ Conversion error ({fmt}): {e}")
 
-    log("🎉 Restoration complete!")
+    # Remove intermediate EPUB if the user only requested AZW3/PDF and those conversions succeeded
+    if "EPUB" not in requested_formats and generated_files and os.path.exists(epub_final):
+        try:
+            os.remove(epub_final)
+        except OSError:
+            pass
+
+    if not generated_files and failed_formats:
+        details = "; ".join(f"{k}: {v}" for k, v in failed_formats.items())
+        raise RuntimeError(f"Failed to generate the requested output format(s): {details}")
+
+    if failed_formats:
+        log(f"⚠️ Restoration finished with conversion warnings: {failed_formats}")
+    else:
+        log("🎉 Restoration complete!")
+
+    return {
+        "output_dir": out_dir,
+        "generated_files": generated_files,
+        "failed_formats": failed_formats,
+    }
