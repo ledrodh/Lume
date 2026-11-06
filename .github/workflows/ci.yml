@@ -39,7 +39,7 @@ jobs:
         run: ruff check core ui tests main.py
 
       - name: Run unit & structural validation tests with coverage
-        run: pytest --cov=core --cov-report=xml --cov-report=term-missing -v
+        run: python -m pytest --cov=core --cov-report=xml --cov-report=term-missing -v
 
   epubcheck-validation:
     name: W3C EPUBCheck 5.4.0 Conformance

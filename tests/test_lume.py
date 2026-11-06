@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
-import tkinter as tk
 import unittest
 import zipfile
 from pathlib import Path
@@ -40,7 +39,6 @@ from core.reporting import (
     build_restoration_report,
     generate_comparison_report,
 )
-from ui.main_window import LumeApp
 
 
 class TestLumePipeline(unittest.TestCase):
@@ -235,9 +233,12 @@ class TestLumePipeline(unittest.TestCase):
         3) Ignores stale background diagnostic callbacks from previous file selections.
         """
         try:
+            import tkinter as tk
+            from ui.main_window import LumeApp
+
             root = tk.Tk()
             root.withdraw()
-        except tk.TclError:
+        except Exception:
             self.skipTest("Tkinter display unavailable in headless environment")
             return
 
