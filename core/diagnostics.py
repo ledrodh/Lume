@@ -53,6 +53,26 @@ def detect_cmap_issues_readonly(doc: fitz.Document) -> list[int]:
     return candidates
 
 
+def determine_ocr_strategy(ext_cnt: int, img_cnt: int, mix_cnt: int) -> tuple[str, float]:
+    """
+    Single source of truth for OCR strategy selection across Diagnostics and Converter.
+    Accounts for extractable_text, image_only, AND mixed (hybrid) pages:
+    - Recommends 'disable_ocr' only when >= 85% of non-empty pages are pure extractable_text
+      AND the combined share of image_only + mixed (hybrid) pages is <= 15%.
+    - Otherwise recommends 'full_ocr'.
+    """
+    non_empty = max(1, ext_cnt + img_cnt + mix_cnt)
+    ext_ratio = ext_cnt / non_empty
+    non_pure_text_ratio = (img_cnt + mix_cnt) / non_empty
+
+    if ext_ratio >= 0.85 and non_pure_text_ratio <= 0.15:
+        confidence = round(min(1.0, 0.70 + 0.30 * ext_ratio), 2)
+        return "disable_ocr", confidence
+
+    confidence = round(min(1.0, 0.65 + 0.35 * non_pure_text_ratio), 2)
+    return "full_ocr", confidence
+
+
 def classify_page(page: fitz.Page, page_number: int) -> PageDiagnostics:
     """
     Classifies a single PDF page into one of four categories:
@@ -132,6 +152,7 @@ def _summarize_diagnostics(
     page_diags: list[PageDiagnostics],
     distinct_global_xrefs: set[int],
     cmap_candidates: list[int],
+    cmap_scan_completed: bool,
     is_complete: bool,
 ) -> DocumentDiagnostics:
     n_sampled = max(1, len(page_diags))
@@ -142,17 +163,7 @@ def _summarize_diagnostics(
     mix_cnt = sum(1 for p in page_diags if p.classification == PageClassification.MIXED.value)
     emp_cnt = sum(1 for p in page_diags if p.classification == PageClassification.EMPTY_OR_UNKNOWN.value)
 
-    non_empty = max(1, ext_cnt + img_cnt + mix_cnt)
-    ext_ratio = ext_cnt / non_empty
-    img_ratio = img_cnt / non_empty
-
-    if ext_ratio >= 0.80 and img_ratio <= 0.10:
-        recommended_mode = "disable_ocr"
-        confidence = round(min(1.0, 0.70 + 0.30 * ext_ratio), 2)
-    else:
-        recommended_mode = "full_ocr"
-        confidence = round(min(1.0, 0.65 + 0.35 * max(img_ratio, 1.0 - ext_ratio)), 2)
-
+    recommended_mode, confidence = determine_ocr_strategy(ext_cnt, img_cnt, mix_cnt)
     if not is_complete:
         confidence = round(confidence * 0.85, 2)
 
@@ -172,6 +183,7 @@ def _summarize_diagnostics(
         total_image_occurrences=sum(p.image_occurrences for p in page_diags),
         total_distinct_images=len(distinct_global_xrefs),
         estimated_footnote_candidates=int(round(sum(p.footnote_candidates for p in page_diags) * scale)),
+        cmap_scan_completed=cmap_scan_completed,
         cmap_issues_detected=len(cmap_candidates),
         cmap_repair_candidates=cmap_candidates,
         recommended_ocr_mode=recommended_mode,
@@ -183,8 +195,10 @@ def _summarize_diagnostics(
 
 def quick_diagnostics(pdf_path: str | Path) -> DocumentDiagnostics:
     """
-    Stage 1 Fast Pre-Flight Diagnostics (< 50ms on typical books).
+    Stage 1 Fast Pre-Flight Diagnostics (< 100ms on typical books).
     Inspects document metadata, page count, first-page aspect ratio, and up to 12 sampled pages.
+    Does not run the full xref CMap stream scan (cmap_scan_completed=False, is_complete=False),
+    ensuring full_diagnostics() always runs in the background to complete CMap verification.
     Strictly read-only.
     """
     path_str = str(pdf_path)
@@ -197,6 +211,7 @@ def quick_diagnostics(pdf_path: str | Path) -> DocumentDiagnostics:
                 file_path=os.path.abspath(path_str),
                 file_name=os.path.basename(path_str),
                 total_pages=0,
+                cmap_scan_completed=True,
                 is_complete=True,
             )
 
@@ -224,7 +239,8 @@ def quick_diagnostics(pdf_path: str | Path) -> DocumentDiagnostics:
             page_diags=page_diags,
             distinct_global_xrefs=distinct_xrefs,
             cmap_candidates=[],
-            is_complete= (total <= len(sample_indices)),
+            cmap_scan_completed=False,
+            is_complete=False,
         )
     finally:
         doc.close()
@@ -250,6 +266,7 @@ def full_diagnostics(
                 file_path=os.path.abspath(path_str),
                 file_name=os.path.basename(path_str),
                 total_pages=0,
+                cmap_scan_completed=True,
                 is_complete=True,
             )
 
@@ -282,6 +299,7 @@ def full_diagnostics(
             page_diags=page_diags,
             distinct_global_xrefs=distinct_xrefs,
             cmap_candidates=cmap_candidates,
+            cmap_scan_completed=True,
             is_complete=True,
         )
     finally:

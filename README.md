@@ -6,8 +6,8 @@ Unlike generic PDF-to-EPUB converters that dump raw OCR text with broken lines, 
 
 1. **🔍 Pre-Flight Document Diagnostics**: Two-stage non-blocking inspection (`quick_diagnostics` + background `full_diagnostics`) that classifies every page into `extractable_text`, `image_only`, `mixed` (hybrid/OCR-overlay), or `empty_or_unknown`, measures distinct vs. repeated image occurrences, estimates footnote density, and performs strictly read-only detection of malformed `ToUnicode` CMap streams before conversion begins.
 2. **✨ Structural Transformation & Triple-Pass HTML Healing**: Combines memory-safe 50-page chunked GPU/CPU extraction (**Marker 1.x / Surya**) with a custom DOM healing engine that repairs broken paragraphs across page boundaries, unwraps false superscripts, rebuilds Kindle-safe Tables of Contents, and links footnotes bidirectionally (`noteref` ↔ `↩`).
-3. **📊 Provenance Tracking & Visual Comparator**: Indexes Marker's JSON block tree (`/page/N/Text/M`) alongside PyMuPDF page text to map restored EPUB paragraphs and footnotes back to their exact source PDF pages. Automatically generates a versioned `restoration_report.json` (`schema_version = "1.0.0"`) and an offline, XSS-safe side-by-side visual comparison report (`comparison_report.html`).
-4. **🛡️ Dual-Layer EPUB 3.3 Validation**: Verifies every generated archive locally via `core/epub_validator.py` (checking `ZIP_STORED` `mimetype` positioning, `META-INF/container.xml`, OPF manifest/spine integrity, XML well-formedness, and generic resolution of all internal `href`/`src` links and `#fragment` anchors) and validates full specification compliance in CI via **W3C EPUBCheck 5.4.0**.
+3. **📊 Progressive Provenance Tracking & Visual Comparator**: Indexes Marker's JSON block tree (`/page/N/Text/M`) alongside a PyMuPDF page-text fallback (`match_method`: `marker_block_id` | `page_text_match` | `unresolved`, with multi-page ambiguity detection) to map restored EPUB paragraphs and footnotes back to their source PDF pages. Automatically generates a privacy-safe, versioned `restoration_report.json` (`schema_version = "1.1.0"`) and an offline, XSS-safe side-by-side visual comparison report (`comparison_report.html`).
+4. **🛡️ Dual-Layer EPUB 3.3 Validation**: Verifies every generated archive locally via `core/epub_validator.py` (checking `ZIP_STORED` `mimetype` positioning, `META-INF/container.xml`, OPF manifest/spine integrity, XML well-formedness, and generic resolution of all internal `href`/`src` links and `#fragment` anchors), blocks downstream Calibre conversions if critical structural errors are detected, and validates full specification compliance in CI via **W3C EPUBCheck 5.4.0**.
 
 ---
 
@@ -66,6 +66,8 @@ Evaluated on the Portuguese academic edition of Ernst Jünger's *O Trabalhador �
 | **Numbered Book Sections Preserved (`1.`–`80.`)** | Structural | Broken into empty `<ol>` lists | **80 / 80** |
 | **Footnote Precision / Recall (Verified Ground Truth)** | Quality | 0.0% / 0.0% | **100.0% Precision / 100.0% Recall** |
 | **W3C EPUB 3.3 OCF & Internal Link Integrity** | Validation | Invalid (`mimetype` deflated) | **0 errors, 0 broken links** |
+
+> 📄 See [`docs/benchmark.md`](docs/benchmark.md) for the full evaluation methodology, metric taxonomy (`operational_metrics` vs. `structural_metrics`), and progressive provenance specification.
 
 ---
 
@@ -166,13 +168,15 @@ Lume/
 ├── ui/
 │   └── main_window.py             # Thread-safe Tkinter GUI, async diagnostics dashboard & report launcher
 ├── core/
-│   ├── models.py                  # Versioned dataclasses (RestorationReport, DocumentDiagnostics, HealingStats)
-│   ├── diagnostics.py             # Two-stage read-only PDF analyzer & 4-state page classifier
+│   ├── models.py                  # Versioned dataclasses (RestorationReport v1.1.0, DocumentDiagnostics, HealingStats)
+│   ├── diagnostics.py             # Two-stage read-only PDF analyzer, 4-state page classifier & unified OCR strategy
 │   ├── pdf_handler.py             # Rotation-safe cover clipping & ToUnicode CMap stream sanitization
 │   ├── converter.py               # Pipeline orchestrator, device detection & chunked Marker execution
 │   ├── html_healer.py             # Triple-Pass HTML healer, paragraph stitcher & OCF EPUB packager
 │   ├── epub_validator.py          # Internal OCF, OPF, XML well-formedness & generic link/anchor validator
-│   └── reporting.py               # Marker/PDF provenance resolver & XSS-safe visual HTML comparator
+│   └── reporting.py               # Progressive provenance resolver & XSS-safe visual HTML comparator
+├── docs/
+│   └── benchmark.md               # Benchmark methodology, ground-truth protocol & provenance specification
 └── tests/
     └── test_lume.py               # Automated unit, concurrency, security & OCF validation test suite
 ```

@@ -168,7 +168,7 @@ class LumeApp:
             + (" (sampled)" if not diag.is_complete else "")
         )
 
-        if not diag.is_complete:
+        if not diag.cmap_scan_completed:
             self.diag_cmap_var.set("Scanning xref streams...")
         elif diag.cmap_issues_detected > 0:
             self.diag_cmap_var.set(f"{diag.cmap_issues_detected} malformed ToUnicode CMap candidate(s) found")
@@ -206,8 +206,10 @@ class LumeApp:
                     )
                     if full_diag is not None and self._diag_request_id == req_id:
                         self.root.after(0, lambda d=full_diag, r=req_id: self._render_diagnostics(d, r))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    err_text = f"{quick_diag.file_name}: Full scan warning ({exc})"
+                    if self._diag_request_id == req_id:
+                        self.root.after(0, lambda msg=err_text: self.diag_status_var.set(msg))
 
             threading.Thread(target=_bg_worker, daemon=True).start()
 

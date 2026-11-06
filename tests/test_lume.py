@@ -12,7 +12,7 @@ import fitz
 from bs4 import BeautifulSoup
 
 from core.converter import _sanitize_markdown
-from core.diagnostics import full_diagnostics, quick_diagnostics
+from core.diagnostics import determine_ocr_strategy, full_diagnostics, quick_diagnostics
 from core.epub_validator import validate_epub_structure
 from core.html_healer import (
     _extract_footnotes_from_soup,
@@ -55,7 +55,8 @@ class TestLumePipeline(unittest.TestCase):
                     operation="cross_page_paragraph_stitching",
                     category="operational",
                     status="success",
-                    succeeded_count=14,
+                    inspected_count=134,
+                    transformed_count=14,
                     skipped_count=120,
                     source_pages=[24, 25],
                 )
@@ -313,9 +314,13 @@ class TestLumePipeline(unittest.TestCase):
             )
 
             resolver = ProvenanceResolver(pdf_path, blocks_json)
-            pages, block_ids = resolver.resolve("Every single element belongs to the organic construction.")
+            pages, block_ids, match_method, ambiguous = resolver.resolve(
+                "Every single element belongs to the organic construction."
+            )
             self.assertEqual(pages, [1])
             self.assertEqual(block_ids, ["/page/0/Text/3"])
+            self.assertEqual(match_method, "marker_block_id")
+            self.assertFalse(ambiguous)
 
             # Verify XSS escaping in comparison report
             diag = quick_diagnostics(pdf_path)
@@ -420,6 +425,85 @@ class TestLumePipeline(unittest.TestCase):
         self.assertEqual(stats.false_sups_unwrapped, 1)
         self.assertEqual(stats.leaked_pages_removed, 2)
         self.assertEqual(stats.paragraphs_stitched, 1)
+
+    def test_edge_cases_short_pdf_cmap_hybrid_ocr_ambiguity_and_privacy(self):
+        """
+        Covers architectural review edge cases:
+        1) Short PDF (<= 12 pages) keeps cmap_scan_completed=False in quick_diagnostics and completes in full_diagnostics.
+        2) Hybrid document (80% extractable_text + 20% mixed) recommends 'full_ocr' instead of 'disable_ocr'.
+        3) ProvenanceResolver detects repeated text across multiple pages (ambiguous=True) and falls back cleanly on bad JSON.
+        4) build_restoration_report omits absolute local file paths by default for privacy.
+        """
+        # 1) Hybrid 80/20 OCR strategy test
+        mode_hybrid, conf_hybrid = determine_ocr_strategy(ext_cnt=8, img_cnt=0, mix_cnt=2)
+        self.assertEqual(mode_hybrid, "full_ocr")
+        self.assertGreater(conf_hybrid, 0.5)
+
+        mode_digital, conf_digital = determine_ocr_strategy(ext_cnt=9, img_cnt=0, mix_cnt=1)
+        self.assertEqual(mode_digital, "disable_ocr")
+        self.assertAlmostEqual(conf_digital, 0.97)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            short_pdf = tmp_path / "short_repeated.pdf"
+
+            doc = fitz.open()
+            for page_idx in range(3):
+                pg = doc.new_page(width=600, height=800)
+                pg.insert_text(
+                    (50, 100),
+                    "Recurring philosophical refrain that appears identically across multiple pages of the treatise.",
+                )
+                pg.insert_text((50, 200), f"Unique paragraph on page {page_idx + 1} with sufficient length.")
+            doc.save(str(short_pdf))
+            doc.close()
+
+            # 2) Short PDF (3 pages <= 12): quick_diagnostics must NOT mark cmap_scan_completed or is_complete
+            q_diag = quick_diagnostics(short_pdf)
+            self.assertFalse(q_diag.cmap_scan_completed)
+            self.assertFalse(q_diag.is_complete)
+
+            f_diag = full_diagnostics(short_pdf)
+            self.assertIsNotNone(f_diag)
+            self.assertTrue(f_diag.cmap_scan_completed)
+            self.assertTrue(f_diag.is_complete)
+
+            # 3) Corrupted blocks JSON fallback + repeated text ambiguity detection
+            bad_json = tmp_path / "corrupted_blocks.json"
+            bad_json.write_text("{not valid json", encoding="utf-8")
+            resolver = ProvenanceResolver(short_pdf, bad_json)
+
+            pages_rep, blk_rep, method_rep, ambig_rep = resolver.resolve(
+                "Recurring philosophical refrain that appears identically across multiple pages of the treatise."
+            )
+            self.assertEqual(pages_rep, [1, 2, 3])
+            self.assertEqual(blk_rep, [])
+            self.assertEqual(method_rep, "page_text_match")
+            self.assertTrue(ambig_rep)
+
+            pages_uniq, _, method_uniq, ambig_uniq = resolver.resolve(
+                "Unique paragraph on page 2 with sufficient length."
+            )
+            self.assertEqual(pages_uniq, [2])
+            self.assertEqual(method_uniq, "page_text_match")
+            self.assertFalse(ambig_uniq)
+
+            # 4) Privacy by default in build_restoration_report
+            report = build_restoration_report(
+                pdf_path=str(short_pdf),
+                title="Privacy Test",
+                author="Author",
+                compute_device="cpu",
+                diagnostics=f_diag,
+                extraction_stats={},
+                healing_stats=HealingStats(paragraphs_inspected=5, paragraphs_stitched=1),
+                validation=ValidationSummary(is_valid=True),
+                export_results={},
+            )
+            report_dict = json.loads(report.to_json())
+            self.assertEqual(report_dict["input_metadata"].get("source_file"), "short_repeated.pdf")
+            self.assertNotIn("source_pdf", report_dict["input_metadata"])
+            self.assertNotIn("file_path", report_dict["diagnostics"])
 
 
 if __name__ == "__main__":

@@ -317,8 +317,10 @@ def _stitch_broken_paragraphs(
                 stitched_Samples = [s for s in stats.samples if s.category == "paragraph_stitching"]
                 if len(stitched_Samples) < 4:
                     merged_txt = p1.get_text().strip()
-                    src_pages, blk_ids = (
-                        provenance.resolve(t1, t2) if provenance is not None else ([], [])
+                    src_pages, blk_ids, match_method, ambiguous = (
+                        provenance.resolve(t1, t2)
+                        if provenance is not None
+                        else ([], [], "unresolved", False)
                     )
                     stats.samples.append(
                         TransformationSample(
@@ -326,6 +328,8 @@ def _stitch_broken_paragraphs(
                             category="paragraph_stitching",
                             source_pages=src_pages,
                             block_ids=blk_ids,
+                            match_method=match_method,
+                            ambiguous=ambiguous,
                             original_excerpt=f"[Part 1]: ...{t1_orig[-140:]}\n[Page Break / Footnote Gap]\n[Part 2]: {t2_orig[:140]}...",
                             restored_excerpt=merged_txt[:320] + ("..." if len(merged_txt) > 320 else ""),
                             description="Reconstructed sentence split across page boundary and removed intervening footer noise.",
@@ -551,8 +555,10 @@ def process_epub_html(
                 linked_count += 1
                 fn_samples = [s for s in stats.samples if s.category == "footnote_linking"]
                 if len(fn_samples) < 4:
-                    src_pages, blk_ids = (
-                        provenance.resolve(fn_data["text"]) if provenance is not None else ([], [])
+                    src_pages, blk_ids, match_method, ambiguous = (
+                        provenance.resolve(fn_data["text"])
+                        if provenance is not None
+                        else ([], [], "unresolved", False)
                     )
                     stats.samples.append(
                         TransformationSample(
@@ -560,6 +566,8 @@ def process_epub_html(
                             category="footnote_linking",
                             source_pages=src_pages,
                             block_ids=blk_ids,
+                            match_method=match_method,
+                            ambiguous=ambiguous,
                             original_excerpt=f"Unlinked footer note {num_key}: {fn_data['text'][:180]}",
                             restored_excerpt=(
                                 f"<li id='fn-{num_key}'><strong>[{num_key}]</strong> "

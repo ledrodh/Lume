@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 
 class PageClassification(str, Enum):
@@ -53,6 +53,7 @@ class DocumentDiagnostics:
     total_image_occurrences: int = 0
     total_distinct_images: int = 0
     estimated_footnote_candidates: int = 0
+    cmap_scan_completed: bool = False
     cmap_issues_detected: int = 0
     cmap_repair_candidates: list[int] = field(default_factory=list)
     recommended_ocr_mode: str = "full_ocr"
@@ -60,10 +61,12 @@ class DocumentDiagnostics:
     is_complete: bool = False
     pages: list[PageDiagnostics] = field(default_factory=list)
 
-    def to_dict(self, include_pages: bool = True) -> dict[str, Any]:
+    def to_dict(self, include_pages: bool = True, include_file_path: bool = False) -> dict[str, Any]:
         data = asdict(self)
         if not include_pages:
             data.pop("pages", None)
+        if not include_file_path:
+            data.pop("file_path", None)
         return data
 
     @classmethod
@@ -74,6 +77,8 @@ class DocumentDiagnostics:
             for p in raw_pages
         ]
         filtered = {k: v for k, v in data.items() if k != "pages"}
+        if "file_path" not in filtered:
+            filtered["file_path"] = filtered.get("file_name", "")
         return cls(**filtered, pages=pages)
 
 
@@ -86,6 +91,8 @@ class TransformationSample:
     restored_excerpt: str
     description: str
     block_ids: list[str] = field(default_factory=list)
+    match_method: str = "unresolved"  # "marker_block_id" | "page_text_match" | "unresolved"
+    ambiguous: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -96,7 +103,8 @@ class TransformationEntry:
     operation: str
     category: str  # "operational" | "structural"
     status: str  # "success" | "skipped" | "failed"
-    succeeded_count: int = 0
+    inspected_count: int = 0
+    transformed_count: int = 0
     skipped_count: int = 0
     failed_count: int = 0
     source_pages: list[int] = field(default_factory=list)

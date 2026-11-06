@@ -56,10 +56,17 @@ class ProvenanceResolver:
     def _normalize(text: str) -> str:
         return re.sub(r"\W+", "", text).lower()
 
-    def resolve(self, *snippets: str) -> tuple[list[int], list[str]]:
-        """Returns (sorted_source_pages, block_ids) for one or more text snippets."""
+    def resolve(self, *snippets: str) -> tuple[list[int], list[str], str, bool]:
+        """
+        Returns (sorted_source_pages, block_ids, match_method, ambiguous) for one or more text snippets.
+        - match_method: "marker_block_id" | "page_text_match" | "unresolved"
+        - ambiguous: True when a single snippet matches multiple distinct pages.
+        """
         pages: set[int] = set()
         block_ids: list[str] = []
+        matched_via_blocks = False
+        matched_via_pages = False
+        ambiguous = False
 
         for snip in snippets:
             if not snip:
@@ -67,24 +74,47 @@ class ProvenanceResolver:
             norm = self._normalize(snip)
             if len(norm) < 10:
                 continue
-            probes = [norm[:36], norm[-36:]] if len(norm) > 40 else [norm]
+            probes = [norm[:72], norm[-72:]] if len(norm) > 80 else [norm]
 
+            snip_block_pages: set[int] = set()
             for probe in probes:
                 if len(probe) < 10:
                     continue
                 for pnum, bid, bnorm in self.block_records:
                     if probe in bnorm:
-                        pages.add(pnum)
+                        snip_block_pages.add(pnum)
                         if bid and bid not in block_ids:
                             block_ids.append(bid)
-                        break
 
+            if snip_block_pages:
+                matched_via_blocks = True
+                if len(snip_block_pages) > 1:
+                    ambiguous = True
+                pages.update(snip_block_pages)
+                continue
+
+            snip_page_hits: set[int] = set()
+            for probe in probes:
+                if len(probe) < 10:
+                    continue
                 for pnum, pnorm in self.page_norms:
                     if probe in pnorm:
-                        pages.add(pnum)
-                        break
+                        snip_page_hits.add(pnum)
 
-        return sorted(pages), block_ids[:4]
+            if snip_page_hits:
+                matched_via_pages = True
+                if len(snip_page_hits) > 1:
+                    ambiguous = True
+                pages.update(snip_page_hits)
+
+        if matched_via_blocks:
+            match_method = "marker_block_id"
+        elif matched_via_pages:
+            match_method = "page_text_match"
+        else:
+            match_method = "unresolved"
+
+        return sorted(pages), block_ids[:4], match_method, ambiguous
 
 
 def build_restoration_report(
@@ -97,10 +127,12 @@ def build_restoration_report(
     healing_stats: HealingStats,
     validation: ValidationSummary,
     export_results: dict,
+    include_full_paths: bool = False,
 ) -> RestorationReport:
     """Assembles the versioned RestorationReport from each stage's structured output."""
     cmaps_repaired = int(extraction_stats.get("cmap_issues_repaired", 0))
     wide_cropped = bool(extraction_stats.get("wide_cover_cropped", False))
+    skipped_paras = max(0, healing_stats.paragraphs_inspected - healing_stats.paragraphs_stitched)
 
     operational_metrics = {
         "pages_processed": diagnostics.total_pages,
@@ -108,7 +140,7 @@ def build_restoration_report(
         "wide_cover_spine_cropped": 1 if wide_cropped else 0,
         "paragraphs_inspected": healing_stats.paragraphs_inspected,
         "paragraphs_stitched": healing_stats.paragraphs_stitched,
-        "paragraphs_unchanged": max(0, healing_stats.paragraphs_inspected - healing_stats.paragraphs_stitched),
+        "paragraphs_skipped_not_split": skipped_paras,
         "false_sups_unwrapped": healing_stats.false_sups_unwrapped,
         "leaked_page_numbers_removed": healing_stats.leaked_pages_removed,
         "em_dashes_normalized": healing_stats.em_dashes_normalized,
@@ -129,8 +161,9 @@ def build_restoration_report(
             operation="cover_extraction_and_spine_crop",
             category="operational",
             status="success" if wide_cropped else "skipped",
-            succeeded_count=1 if wide_cropped else 0,
-            skipped_count=0 if wide_cropped else 1,
+            inspected_count=1 if diagnostics.total_pages > 0 else 0,
+            transformed_count=1 if wide_cropped else 0,
+            skipped_count=0 if wide_cropped else (1 if diagnostics.total_pages > 0 else 0),
             source_pages=[1] if diagnostics.total_pages > 0 else [],
             details="Cropped wide two-page spread cover using visual coordinate clipping."
             if wide_cropped
@@ -140,7 +173,8 @@ def build_restoration_report(
             operation="tounicode_cmap_sanitization",
             category="operational",
             status="success" if cmaps_repaired > 0 else "skipped",
-            succeeded_count=cmaps_repaired,
+            inspected_count=max(diagnostics.cmap_issues_detected, cmaps_repaired),
+            transformed_count=cmaps_repaired,
             skipped_count=max(0, diagnostics.cmap_issues_detected - cmaps_repaired),
             details=f"Repaired {cmaps_repaired} malformed ToUnicode CMap stream(s).",
         ),
@@ -148,15 +182,20 @@ def build_restoration_report(
             operation="cross_page_paragraph_stitching",
             category="operational",
             status="success" if healing_stats.paragraphs_stitched > 0 else "skipped",
-            succeeded_count=healing_stats.paragraphs_stitched,
-            skipped_count=max(0, healing_stats.paragraphs_inspected - healing_stats.paragraphs_stitched),
-            details=f"Stitched {healing_stats.paragraphs_stitched} broken paragraph(s) across page breaks.",
+            inspected_count=healing_stats.paragraphs_inspected,
+            transformed_count=healing_stats.paragraphs_stitched,
+            skipped_count=skipped_paras,
+            details=(
+                f"Inspected {healing_stats.paragraphs_inspected} paragraph(s); "
+                f"stitched {healing_stats.paragraphs_stitched} split paragraph(s) across page breaks."
+            ),
         ),
         TransformationEntry(
             operation="bidirectional_footnote_linking",
             category="structural",
             status="success" if healing_stats.footnotes_linked > 0 else "skipped",
-            succeeded_count=healing_stats.footnotes_linked,
+            inspected_count=healing_stats.footnotes_extracted,
+            transformed_count=healing_stats.footnotes_linked,
             skipped_count=healing_stats.footnotes_unlinked,
             details=(
                 f"Extracted {healing_stats.footnotes_extracted} footnote(s) and linked "
@@ -167,21 +206,25 @@ def build_restoration_report(
             operation="toc_kindle_safe_reconstruction",
             category="structural",
             status="success" if healing_stats.toc_entries_rebuilt > 0 else "skipped",
-            succeeded_count=healing_stats.toc_entries_rebuilt,
+            inspected_count=healing_stats.toc_tables_inspected,
+            transformed_count=healing_stats.toc_entries_rebuilt,
             skipped_count=max(0, healing_stats.toc_tables_inspected - (1 if healing_stats.toc_entries_rebuilt else 0)),
             details=f"Rebuilt {healing_stats.toc_entries_rebuilt} Kindle-safe Table of Contents entry(ies).",
         ),
     ]
 
+    input_metadata = {
+        "source_file": os.path.basename(pdf_path),
+        "resolved_title": title,
+        "resolved_author": author,
+    }
+    if include_full_paths:
+        input_metadata["source_pdf"] = os.path.abspath(pdf_path)
+
     return RestorationReport(
-        input_metadata={
-            "source_pdf": os.path.abspath(pdf_path),
-            "file_name": os.path.basename(pdf_path),
-            "resolved_title": title,
-            "resolved_author": author,
-        },
+        input_metadata=input_metadata,
         environment=collect_runtime_environment(compute_device),
-        diagnostics=diagnostics.to_dict(include_pages=False),
+        diagnostics=diagnostics.to_dict(include_pages=False, include_file_path=include_full_paths),
         operational_metrics=operational_metrics,
         structural_metrics=structural_metrics,
         transformations=transformations,
@@ -250,14 +293,15 @@ def generate_comparison_report(
     sample_cards_html: list[str] = []
     for idx, s in enumerate(report.samples, 1):
         pages_str = ", ".join(f"Page {p}" for p in s.source_pages) if s.source_pages else "Document Body"
-        blocks_str = ", ".join(s.block_ids) if s.block_ids else "Heuristic Page Match"
+        blocks_str = ", ".join(s.block_ids) if s.block_ids else s.match_method
+        ambig_badge = ' <span style="color: var(--warn); font-weight: 700;">[Ambiguous Match]</span>' if s.ambiguous else ""
         thumbs_html = ""
         for p in s.source_pages[:2]:
             if p in rendered_thumbs:
                 thumbs_html += (
                     f'<div class="thumb-wrap">'
-                    f'<img src="{esc(rendered_thumbs[p])}" alt="PDF Page {p}" loading="lazy"/>'
-                    f'<span>Source PDF — Page {p}</span>'
+                    f'<img src="{esc(rendered_thumbs[p])}" alt="Original PDF Page — Page {p}" loading="lazy"/>'
+                    f'<span>Original PDF Page — Page {p}</span>'
                     f"</div>"
                 )
 
@@ -266,12 +310,12 @@ def generate_comparison_report(
             <div class="sample-card">
               <div class="sample-header">
                 <span class="sample-tag">#{idx} · {esc(s.category.replace('_', ' ').upper())}</span>
-                <span class="sample-prov">📍 Provenance: <strong>{esc(pages_str)}</strong> ({esc(blocks_str)})</span>
+                <span class="sample-prov">📍 Provenance: <strong>{esc(pages_str)}</strong> ({esc(blocks_str)} · {esc(s.match_method)}){ambig_badge}</span>
               </div>
               <p class="sample-desc">{esc(s.description)}</p>
               <div class="compare-grid">
                 <div class="compare-col col-before">
-                  <h4>Original PDF Fragment (Before Healing)</h4>
+                  <h4>Pre-Healing Extracted Text</h4>
                   {thumbs_html}
                   <pre class="excerpt">{esc(s.original_excerpt)}</pre>
                 </div>

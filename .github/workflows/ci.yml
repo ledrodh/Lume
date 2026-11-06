@@ -74,8 +74,9 @@ jobs:
 
       - name: Generate sample healed EPUB via Pandoc + Lume and validate with EPUBCheck 5.4.0
         run: |
-          python -c "
-          import subprocess, tempfile
+          python - << 'EOF'
+          import subprocess
+          import tempfile
           from pathlib import Path
           from core.converter import _sanitize_markdown
           from core.html_healer import process_epub_html
@@ -83,23 +84,23 @@ jobs:
 
           with tempfile.TemporaryDirectory() as tmp:
               tmp_p = Path(tmp)
-              md_file = tmp_p / 'sample.md'
-              raw_epub = tmp_p / 'raw.epub'
-              healed_epub = Path('/tmp/lume_validated_sample.epub')
+              md_file = tmp_p / "sample.md"
+              raw_epub = tmp_p / "raw.epub"
+              healed_epub = Path("/tmp/lume_validated_sample.epub")
 
               md_content = _sanitize_markdown(
-                  '# Part I\n\n## The Third Estate\n\n1.\n\n'
-                  'This is a paragraph with a quotation «important»1 and italic *sansculottism*2.\n\n'
-                  '<sup>1</sup> First footnote reference.\n\n'
-                  '<sup>2</sup> Second footnote reference.\n'
+                  "# Part I\n\n## The Third Estate\n\n1.\n\n"
+                  "This is a paragraph with a quotation «important»1 and italic *sansculottism*2.\n\n"
+                  "<sup>1</sup> First footnote reference.\n\n"
+                  "<sup>2</sup> Second footnote reference.\n"
               )
-              md_file.write_text(md_content, encoding='utf-8')
+              md_file.write_text(md_content, encoding="utf-8")
               subprocess.run(
-                  ['pandoc', str(md_file), '-o', str(raw_epub), '-M', 'title=Lume Validation Sample', '-M', 'author=Lume CI'],
-                  check=True
+                  ["pandoc", str(md_file), "-o", str(raw_epub), "-M", "title=Lume Validation Sample", "-M", "author=Lume CI"],
+                  check=True,
               )
-              process_epub_html(str(raw_epub), str(healed_epub), '')
+              process_epub_html(str(raw_epub), str(healed_epub), "")
               summary = validate_epub_structure(healed_epub)
-              assert summary.is_valid, f'Internal validator failed: {summary.issues}'
-          "
+              assert summary.is_valid, f"Internal validator failed: {summary.issues}"
+          EOF
           java -jar /tmp/epubcheck/epubcheck-5.4.0/epubcheck.jar /tmp/lume_validated_sample.epub

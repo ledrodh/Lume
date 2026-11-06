@@ -18,7 +18,6 @@ from core.models import DocumentDiagnostics, HealingStats
 from core.pdf_handler import (
     extract_cover_and_content,
     extract_pdf_metadata,
-    is_born_digital_pdf,
 )
 from core.reporting import (
     ProvenanceResolver,
@@ -195,7 +194,7 @@ def _sanitize_markdown(md_text: str, pdf_path: str | None = None) -> str:
                     try:
                         doc = fitz.open(pdf_path)
                         for page in doc:
-                            lines = [l.strip() for l in page.get_text().splitlines() if l.strip()]
+                            lines = [line.strip() for line in page.get_text().splitlines() if line.strip()]
                             if len(lines) >= 2 and re.match(rf"^{missing_num}\.?$", lines[-1]):
                                 anchor = lines[-2][-35:].strip()
                                 if anchor and anchor in segment:
@@ -303,8 +302,8 @@ for start_idx in range(0, total_pages, chunk_size):
             json_out = json_renderer(document)
             for idx_p, page_node in enumerate(getattr(json_out, "children", []) or []):
                 collect_json_blocks(page_node, start_idx + idx_p + 1)
-        except Exception:
-            pass
+        except Exception as exc:
+            log(f"⚠ Provenance JSON warning on pages {start_idx + 1}-{end_idx}: {exc}")
 
     md_chunks.append(rendered.markdown.strip())
     if getattr(rendered, "images", None):
@@ -338,6 +337,7 @@ def process_book(
     formats: list,
     start_page: int = 1,
     diagnostics: DocumentDiagnostics | None = None,
+    strict_validation: bool = True,
 ) -> dict:
     pdf_in = os.path.abspath(pdf_in)
     out_dir = os.path.abspath(out_dir)
@@ -394,10 +394,15 @@ def process_book(
     env["VLM_BACKEND"] = "torch"
 
     content_pdf_path = os.path.join(marker_in_dir, "content.pdf")
-    disable_ocr_flag = "1" if is_born_digital_pdf(content_pdf_path) else "0"
+    content_diag = (
+        diagnostics
+        if start_page <= 1
+        else (full_diagnostics(content_pdf_path) or diagnostics)
+    )
+    disable_ocr_flag = "1" if content_diag.recommended_ocr_mode == "disable_ocr" else "0"
 
     if disable_ocr_flag == "1":
-        log("📄 Native digital text layer detected -> enabling --disable_ocr for 100% text fidelity and 3x speed.")
+        log("📄 Unified diagnostics strategy: direct vector extraction (--disable_ocr) enabled for 100% text fidelity.")
 
     log(f"🔍 Running Marker in memory-safe 50-page chunks (device: {compute_device.upper()}, native PyTorch)...")
     log(f"-> Python/Marker environment resolved at: {marker_py}")
@@ -484,7 +489,14 @@ def process_book(
     generated_files = []
     failed_formats = {}
 
-    if "EPUB" in requested_formats:
+    epub_blocked = strict_validation and not validation_summary.is_valid
+    if epub_blocked:
+        err_codes = ", ".join(
+            i.code for i in validation_summary.issues if i.severity == "error"
+        )
+        failed_formats["EPUB"] = f"OCF/EPUB structural validation failed ({err_codes})"
+        log(f"❌ Blocking downstream export due to critical EPUB validation error(s): {err_codes}")
+    elif "EPUB" in requested_formats:
         generated_files.append(epub_final)
 
     # 6. Additional Format Conversions via Calibre (uses temporary files for stdout/stderr instead of PIPE
@@ -493,6 +505,9 @@ def process_book(
 
     for fmt in requested_formats:
         if fmt in ["AZW3", "PDF"]:
+            if epub_blocked:
+                failed_formats[fmt] = "Blocked because upstream EPUB failed structural validation"
+                continue
             out_file = os.path.join(out_dir, f"{base_name}.{fmt.lower()}")
             log(f"📱 Converting to {fmt}...")
             try:
