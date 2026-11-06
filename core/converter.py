@@ -455,7 +455,7 @@ def process_book(
     if os.path.exists(cover_jpg):
         pandoc_cmd += ["--epub-cover-image", cover_jpg]
 
-    pandoc_cmd += ["-M", f"title={title}", "-M", f"author={author}"]
+    pandoc_cmd += ["-M", f"title={title}", "-M", f"author={author}", "-M", "lang=pt-BR"]
 
     subprocess.run(
         pandoc_cmd,

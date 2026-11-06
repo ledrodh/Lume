@@ -90,7 +90,18 @@ jobs:
               )
               md_file.write_text(md_content, encoding="utf-8")
               subprocess.run(
-                  ["pandoc", str(md_file), "-o", str(raw_epub), "-M", "title=Lume Validation Sample", "-M", "author=Lume CI"],
+                  [
+                      "pandoc",
+                      str(md_file),
+                      "-o",
+                      str(raw_epub),
+                      "-M",
+                      "title=Lume Validation Sample",
+                      "-M",
+                      "author=Lume CI",
+                      "-M",
+                      "lang=en-US",
+                  ],
                   check=True,
               )
               process_epub_html(str(raw_epub), str(healed_epub), "")
