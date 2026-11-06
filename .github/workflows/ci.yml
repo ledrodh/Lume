@@ -1,0 +1,105 @@
+name: Lume CI & Validation Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  lint-and-unit-tests:
+    name: Lint & Unit Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system Pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+
+      - name: Install lightweight test & lint dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install PyMuPDF beautifulsoup4 pypandoc pytest pytest-cov ruff
+
+      - name: Run Ruff linter
+        run: ruff check core ui tests main.py
+
+      - name: Run unit & structural validation tests with coverage
+        run: pytest --cov=core --cov-report=xml --cov-report=term-missing -v
+
+  epubcheck-validation:
+    name: W3C EPUBCheck 5.4.0 Conformance
+    runs-on: ubuntu-latest
+    needs: lint-and-unit-tests
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Java JDK 17 (Required for EPUBCheck)
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Install Pandoc & Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+          pip install PyMuPDF beautifulsoup4 pypandoc pytest
+
+      - name: Download W3C EPUBCheck 5.4.0
+        run: |
+          curl -sSL https://github.com/w3c/epubcheck/releases/download/v5.4.0/epubcheck-5.4.0.zip -o epubcheck.zip
+          unzip -q epubcheck.zip -d /tmp/epubcheck
+
+      - name: Generate sample healed EPUB via Pandoc + Lume and validate with EPUBCheck 5.4.0
+        run: |
+          python -c "
+          import subprocess, tempfile
+          from pathlib import Path
+          from core.converter import _sanitize_markdown
+          from core.html_healer import process_epub_html
+          from core.epub_validator import validate_epub_structure
+
+          with tempfile.TemporaryDirectory() as tmp:
+              tmp_p = Path(tmp)
+              md_file = tmp_p / 'sample.md'
+              raw_epub = tmp_p / 'raw.epub'
+              healed_epub = Path('/tmp/lume_validated_sample.epub')
+
+              md_content = _sanitize_markdown(
+                  '# Part I\n\n## The Third Estate\n\n1.\n\n'
+                  'This is a paragraph with a quotation «important»1 and italic *sansculottism*2.\n\n'
+                  '<sup>1</sup> First footnote reference.\n\n'
+                  '<sup>2</sup> Second footnote reference.\n'
+              )
+              md_file.write_text(md_content, encoding='utf-8')
+              subprocess.run(
+                  ['pandoc', str(md_file), '-o', str(raw_epub), '-M', 'title=Lume Validation Sample', '-M', 'author=Lume CI'],
+                  check=True
+              )
+              process_epub_html(str(raw_epub), str(healed_epub), '')
+              summary = validate_epub_structure(healed_epub)
+              assert summary.is_valid, f'Internal validator failed: {summary.issues}'
+          "
+          java -jar /tmp/epubcheck/epubcheck-5.4.0/epubcheck.jar /tmp/lume_validated_sample.epub

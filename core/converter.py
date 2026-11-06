@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import re
 import shutil
@@ -9,11 +11,19 @@ from pathlib import Path
 import fitz
 import pypandoc
 
+from core.diagnostics import full_diagnostics, quick_diagnostics
+from core.epub_validator import validate_epub_structure
 from core.html_healer import process_epub_html
+from core.models import DocumentDiagnostics, HealingStats
 from core.pdf_handler import (
     extract_cover_and_content,
     extract_pdf_metadata,
     is_born_digital_pdf,
+)
+from core.reporting import (
+    ProvenanceResolver,
+    build_restoration_report,
+    generate_comparison_report,
 )
 
 
@@ -206,13 +216,17 @@ def _sanitize_markdown(md_text: str, pdf_path: str | None = None) -> str:
 
 _CHUNKED_MARKER_SCRIPT = """
 import os
+import re
 import sys
 import gc
+import json
 import torch
 import fitz
 from pathlib import Path
+from bs4 import BeautifulSoup
 from marker.config.parser import ConfigParser
 from marker.models import create_model_dict
+from marker.renderers.json import JSONRenderer
 
 pdf_path = sys.argv[1]
 work_dir = sys.argv[2]
@@ -237,6 +251,27 @@ out_folder.mkdir(parents=True, exist_ok=True)
 
 models = create_model_dict()
 md_chunks = []
+provenance_blocks = []
+
+def collect_json_blocks(node, default_page):
+    b_id = str(getattr(node, "id", "") or "")
+    m_page = re.search(r"/page/(\\d+)/", b_id)
+    page_num = (int(m_page.group(1)) + 1) if m_page else default_page
+    children = getattr(node, "children", None)
+    if children:
+        for ch in children:
+            collect_json_blocks(ch, page_num)
+    else:
+        raw_html = getattr(node, "html", "") or ""
+        if raw_html:
+            txt = BeautifulSoup(raw_html, "html.parser").get_text(" ", strip=True)
+            if len(txt) >= 15:
+                provenance_blocks.append({
+                    "page_number": page_num,
+                    "block_id": b_id,
+                    "block_type": str(getattr(node, "block_type", "")),
+                    "text": txt[:400],
+                })
 
 for start_idx in range(0, total_pages, chunk_size):
     end_idx = min(start_idx + chunk_size, total_pages)
@@ -259,12 +294,24 @@ for start_idx in range(0, total_pages, chunk_size):
         renderer=config_parser.get_renderer(),
         llm_service=config_parser.get_llm_service(),
     )
-    rendered = converter(pdf_path)
+    with converter.filepath_to_str(pdf_path) as temp_path:
+        document = converter.build_document(temp_path)
+        md_renderer = converter.resolve_dependencies(converter.renderer)
+        rendered = md_renderer(document)
+        try:
+            json_renderer = converter.resolve_dependencies(JSONRenderer)
+            json_out = json_renderer(document)
+            for idx_p, page_node in enumerate(getattr(json_out, "children", []) or []):
+                collect_json_blocks(page_node, start_idx + idx_p + 1)
+        except Exception:
+            pass
+
     md_chunks.append(rendered.markdown.strip())
     if getattr(rendered, "images", None):
         for img_name, img_obj in rendered.images.items():
             img_obj.save(out_folder / img_name)
 
+    del document
     del rendered
     del converter
     gc.collect()
@@ -273,7 +320,10 @@ for start_idx in range(0, total_pages, chunk_size):
 
 final_md = "\\n\\n".join(md_chunks) + "\\n"
 (out_folder / "content.md").write_text(final_md, encoding="utf-8")
-log(f"-> All {total_pages} pages successfully converted to Markdown.")
+(out_folder / "provenance_blocks.json").write_text(
+    json.dumps(provenance_blocks, ensure_ascii=False), encoding="utf-8"
+)
+log(f"-> All {total_pages} pages successfully converted to Markdown ({len(provenance_blocks)} provenance blocks indexed).")
 """
 
 
@@ -287,16 +337,24 @@ def process_book(
     author: str,
     formats: list,
     start_page: int = 1,
+    diagnostics: DocumentDiagnostics | None = None,
 ) -> dict:
     pdf_in = os.path.abspath(pdf_in)
     out_dir = os.path.abspath(out_dir)
 
+    if diagnostics is None or not diagnostics.is_complete:
+        diagnostics = full_diagnostics(pdf_in) or quick_diagnostics(pdf_in)
+
     embedded_meta = extract_pdf_metadata(pdf_in)
     if not title or not title.strip():
-        title = embedded_meta.get("title") or os.path.splitext(os.path.basename(pdf_in))[0]
+        title = (
+            diagnostics.embedded_title
+            or embedded_meta.get("title")
+            or os.path.splitext(os.path.basename(pdf_in))[0]
+        )
 
     if not author or not author.strip():
-        author = embedded_meta.get("author") or "Unknown"
+        author = diagnostics.embedded_author or embedded_meta.get("author") or "Unknown"
 
     work_dir = os.path.join(out_dir, "workdir")
     marker_in_dir = os.path.join(work_dir, "marker_input")
@@ -309,12 +367,14 @@ def process_book(
 
     if os.path.exists(log_path):
         os.remove(log_path)
-    log = lambda msg: _log(log_path, msg)
+
+    def log(msg: str):
+        _log(log_path, msg)
 
     # 1. Cover & Content Extraction
     content_pdf = os.path.join(marker_in_dir, "content.pdf")
     cover_jpg = os.path.join(work_dir, "cover.jpg")
-    extract_cover_and_content(pdf_in, cover_jpg, content_pdf, start_page, log_path)
+    extraction_stats = extract_cover_and_content(pdf_in, cover_jpg, content_pdf, start_page, log_path)
 
     # 2. OCR / Layout Extraction (Chunked to avoid ArrayMemoryError on large books)
     marker_py = get_marker_python()
@@ -402,10 +462,23 @@ def process_book(
         cwd=os.path.dirname(md_path),
     )
 
-    # 5. HTML Healing & OCF Packaging
+    # 5. HTML Healing, Provenance Mapping & OCF Validation
     base_name = _sanitize_name(title)
     epub_final = os.path.join(out_dir, f"{base_name}.epub")
-    process_epub_html(temp_epub, epub_final, log_path)
+    blocks_json_path = os.path.join(os.path.dirname(md_path), "provenance_blocks.json")
+    provenance = ProvenanceResolver(content_pdf_path, blocks_json_path)
+    healing_stats = HealingStats()
+
+    process_epub_html(temp_epub, epub_final, log_path, stats=healing_stats, provenance=provenance)
+
+    validation_summary = validate_epub_structure(epub_final)
+    if validation_summary.is_valid:
+        log(
+            f"🛡️ OCF/EPUB validation passed ({validation_summary.checked_files} files, "
+            f"{validation_summary.checked_links} internal links verified)."
+        )
+    else:
+        log(f"⚠️ OCF/EPUB validation found {len(validation_summary.issues)} issue(s).")
 
     requested_formats = [f.upper() for f in formats]
     generated_files = []
@@ -445,6 +518,29 @@ def process_book(
         except OSError:
             pass
 
+    export_results = {
+        "requested_formats": requested_formats,
+        "generated_files": generated_files,
+        "failed_formats": failed_formats,
+    }
+
+    # 7. Save Structured Restoration Report & Visual Comparison HTML
+    report = build_restoration_report(
+        pdf_path=pdf_in,
+        title=title,
+        author=author,
+        compute_device=compute_device,
+        diagnostics=diagnostics,
+        extraction_stats=extraction_stats,
+        healing_stats=healing_stats,
+        validation=validation_summary,
+        export_results=export_results,
+    )
+    report_json_path = os.path.join(out_dir, "restoration_report.json")
+    report.save(report_json_path)
+    comparison_html_path = generate_comparison_report(report, content_pdf_path, out_dir)
+    log(f"📊 Audit report & visual comparator generated at: {comparison_html_path}")
+
     if not generated_files and failed_formats:
         details = "; ".join(f"{k}: {v}" for k, v in failed_formats.items())
         raise RuntimeError(f"Failed to generate the requested output format(s): {details}")
@@ -458,4 +554,6 @@ def process_book(
         "output_dir": out_dir,
         "generated_files": generated_files,
         "failed_formats": failed_formats,
+        "report_path": report_json_path,
+        "comparison_html_path": comparison_html_path,
     }

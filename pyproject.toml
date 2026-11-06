@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+exclude = ["books_test", "book_test", "Restored_Output", "venv", ".venv"]
+
+[tool.ruff.lint]
+select = ["E", "F"]
+ignore = ["E501"]

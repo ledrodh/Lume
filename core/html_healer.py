@@ -1,11 +1,16 @@
+from __future__ import annotations
+
 import re
 import tempfile
 import zipfile
 from pathlib import Path
 from bs4 import BeautifulSoup, Tag, NavigableString
 
+from core.models import HealingStats, TransformationSample
+from core.reporting import ProvenanceResolver
 
-def heal_html(soup: BeautifulSoup):
+
+def heal_html(soup: BeautifulSoup, stats: HealingStats | None = None):
     """Applies Kindle-safe CSS, unwraps false superscripts, removes leaked page numbers, and fixes hyphenation."""
     style_tag = soup.new_tag("style", type="text/css")
     style_tag.string = """
@@ -37,12 +42,16 @@ def heal_html(soup: BeautifulSoup):
             )
             replacement = (f" {txt}" if need_space_before else txt) + (" " if need_space_after else "")
             sup.replace_with(NavigableString(replacement))
+            if stats is not None:
+                stats.false_sups_unwrapped += 1
 
     # 2. Remove standalone paragraphs that contain only leaked header/footer page numbers (e.g., <p>329</p>)
     for p in list(soup.find_all("p")):
         txt = p.get_text(strip=True)
         if re.match(r"^\d{1,4}$", txt):
             p.decompose()
+            if stats is not None:
+                stats.leaked_pages_removed += 1
 
     # 3. Clean PUA characters from Symbol font (⎯\uf8e7 -> —) and join ghost hyphenations across line breaks
     for node in list(soup.find_all(string=True)):
@@ -50,7 +59,10 @@ def heal_html(soup: BeautifulSoup):
             continue
         orig = str(node)
         text = orig.replace("\xa0", " ").replace("\t", " ")
+        dash_fixes = text.count("\u23af\uf8e7") + text.count("\uf8e7") + text.count("\u23af")
         text = text.replace("\u23af\uf8e7", "—").replace("\uf8e7", "—").replace("\u23af", "—")
+        if stats is not None and dash_fixes > 0:
+            stats.em_dashes_normalized += dash_fixes
         # Only join hyphenated words when the second part starts with a lowercase letter, preserving proper compounds
         text = re.sub(r"([A-Za-zÀ-ÿ]{2,})-\s+([a-zà-ÿ]{2,})", r"\1\2", text)
         if text != orig:
@@ -74,7 +86,7 @@ def is_toc_table(table: Tag) -> bool:
     return (hits / len(rows)) >= 0.35
 
 
-def transform_toc_kindle_safe(table: Tag, soup: BeautifulSoup) -> Tag:
+def transform_toc_kindle_safe(table: Tag, soup: BeautifulSoup, stats: HealingStats | None = None) -> Tag:
     """Replaces TOC tables with float-based <p> elements that render reliably on Kindle devices."""
     rows = table.find_all("tr")
     entries = []
@@ -90,6 +102,9 @@ def transform_toc_kindle_safe(table: Tag, soup: BeautifulSoup) -> Tag:
             title = (" ".join(c.get_text(separator=" ", strip=True) for c in cells[:-1]) + " " + remainder).strip()
             level = "sub" if re.match(r"^[IVXLCDM]+\.\s", title, re.IGNORECASE) else "chapter"
             entries.append({"title": title, "page": page, "level": level})
+
+    if stats is not None:
+        stats.toc_entries_rebuilt += len(entries)
 
     nav_div = soup.new_tag("div", attrs={"style": "margin: 2em 0;"})
     for e in entries:
@@ -130,7 +145,12 @@ def _clean_fn_html(html_fragment: str) -> tuple[str, str]:
     return html_str, plain
 
 
-def _extract_footnotes_from_soup(fname: str, soup: BeautifulSoup, g_notes: dict):
+def _extract_footnotes_from_soup(
+    fname: str,
+    soup: BeautifulSoup,
+    g_notes: dict,
+    stats: HealingStats | None = None,
+):
     """
     Extracts footnotes across multiple layout formats:
     1) Paragraphs starting with <sup>N</sup> (including multiple <sup>N</sup> notes merged into one <p>)
@@ -164,6 +184,8 @@ def _extract_footnotes_from_soup(fname: str, soup: BeautifulSoup, g_notes: dict)
                 if ftext:
                     g_notes[fnum] = {"text": ftext, "html": fhtml, "file": fname, "refs": []}
                     last_fn_num = fnum
+                    if stats is not None:
+                        stats.footnotes_extracted += 1
             p.decompose()
             i += 1
             continue
@@ -182,6 +204,8 @@ def _extract_footnotes_from_soup(fname: str, soup: BeautifulSoup, g_notes: dict)
                     if ftext:
                         g_notes[fnum] = {"text": ftext, "html": fhtml, "file": fname, "refs": []}
                         last_fn_num = fnum
+                        if stats is not None:
+                            stats.footnotes_extracted += 1
                 p.decompose()
                 i += 1
                 continue
@@ -210,6 +234,8 @@ def _extract_footnotes_from_soup(fname: str, soup: BeautifulSoup, g_notes: dict)
             ftext = re.sub(r"\s+", " ", m_classic.group(2)).strip()
             g_notes[fnum] = {"text": ftext, "html": ftext, "file": fname, "refs": []}
             last_fn_num = fnum
+            if stats is not None:
+                stats.footnotes_extracted += 1
             p.decompose()
             i += 1
             continue
@@ -220,12 +246,19 @@ def _extract_footnotes_from_soup(fname: str, soup: BeautifulSoup, g_notes: dict)
         i += 1
 
 
-def _stitch_broken_paragraphs(soup: BeautifulSoup):
+def _stitch_broken_paragraphs(
+    soup: BeautifulSoup,
+    stats: HealingStats | None = None,
+    provenance: ProvenanceResolver | None = None,
+):
     """
     Rejoins body paragraphs that were split across page breaks (and across removed footnote blocks).
     Also strips leaked running page numbers at the end of a line before a page break.
     """
     paragraphs = [p for p in soup.find_all("p") if p.parent and "toc-entry" not in (p.get("class") or [])]
+    if stats is not None:
+        stats.paragraphs_inspected += len(paragraphs)
+
     i = 0
     while i < len(paragraphs) - 1:
         p1 = paragraphs[i]
@@ -246,8 +279,10 @@ def _stitch_broken_paragraphs(soup: BeautifulSoup):
             i += 1
             continue
 
-        t1 = p1.get_text().strip()
-        t2 = p2.get_text().strip()
+        t1_orig = p1.get_text().strip()
+        t2_orig = p2.get_text().strip()
+        t1 = t1_orig
+        t2 = t2_orig
         if not t1 or not t2:
             i += 1
             continue
@@ -260,6 +295,8 @@ def _stitch_broken_paragraphs(soup: BeautifulSoup):
                 cleaned = re.sub(r"\s+\d{1,3}\s*$", "", str(last_node))
                 last_node.replace_with(NavigableString(cleaned))
                 t1 = p1.get_text().strip()
+                if stats is not None:
+                    stats.leaked_pages_removed += 1
 
         # Stitch condition: p1 does not end a sentence and p2 continues with lowercase (or p1 ends with a dangling article/preposition)
         p1_incomplete = not _ends_sentence(t1)
@@ -274,6 +311,26 @@ def _stitch_broken_paragraphs(soup: BeautifulSoup):
                 p1.append(child.extract())
             p2.decompose()
             paragraphs.pop(i + 1)
+
+            if stats is not None:
+                stats.paragraphs_stitched += 1
+                stitched_Samples = [s for s in stats.samples if s.category == "paragraph_stitching"]
+                if len(stitched_Samples) < 4:
+                    merged_txt = p1.get_text().strip()
+                    src_pages, blk_ids = (
+                        provenance.resolve(t1, t2) if provenance is not None else ([], [])
+                    )
+                    stats.samples.append(
+                        TransformationSample(
+                            sample_id=f"stitch-{stats.paragraphs_stitched}",
+                            category="paragraph_stitching",
+                            source_pages=src_pages,
+                            block_ids=blk_ids,
+                            original_excerpt=f"[Part 1]: ...{t1_orig[-140:]}\n[Page Break / Footnote Gap]\n[Part 2]: {t2_orig[:140]}...",
+                            restored_excerpt=merged_txt[:320] + ("..." if len(merged_txt) > 320 else ""),
+                            description="Reconstructed sentence split across page boundary and removed intervening footer noise.",
+                        )
+                    )
         else:
             i += 1
 
@@ -301,8 +358,17 @@ def _package_epub(source_dir: Path, epub_out: str):
                 zo.write(f, arcname, compress_type=zipfile.ZIP_DEFLATED)
 
 
-def process_epub_html(epub_in: str, epub_out: str, log_path: str = ""):
+def process_epub_html(
+    epub_in: str,
+    epub_out: str,
+    log_path: str = "",
+    stats: HealingStats | None = None,
+    provenance: ProvenanceResolver | None = None,
+) -> HealingStats:
     """Triple-Pass: Reconstructs the EPUB applying heals to HTML, Paragraphs, TOC, and Footnotes."""
+    if stats is None:
+        stats = HealingStats()
+
     def log(msg: str):
         if log_path:
             with open(log_path, "a", encoding="utf-8") as f:
@@ -318,13 +384,13 @@ def process_epub_html(epub_in: str, epub_out: str, log_path: str = ""):
         soups = {x.name: BeautifulSoup(x.read_text(encoding="utf-8"), "html.parser") for x in xhtmls}
 
         for s in soups.values():
-            heal_html(s)
+            heal_html(s, stats)
 
         # --- PHASE 1: Global Footnote Memory & Paragraph Stitching ---
         g_notes = {}
         for fname, s in soups.items():
-            _extract_footnotes_from_soup(fname, s, g_notes)
-            _stitch_broken_paragraphs(s)
+            _extract_footnotes_from_soup(fname, s, g_notes, stats)
+            _stitch_broken_paragraphs(s, stats, provenance)
 
         toc_state = {"found": False, "finished": False}
         ocr_map = {"l": "1", "I": "1", "O": "0", "º": "0", "°": "0"}
@@ -347,9 +413,10 @@ def process_epub_html(epub_in: str, epub_out: str, log_path: str = ""):
 
         for fname, s in soups.items():
             for table in s.find_all("table"):
+                stats.toc_tables_inspected += 1
                 if is_toc_table(table) and not toc_state["finished"]:
                     toc_state["found"] = True
-                    table.replace_with(transform_toc_kindle_safe(table, s))
+                    table.replace_with(transform_toc_kindle_safe(table, s, stats))
                 elif toc_state["found"]:
                     toc_state["finished"] = True
 
@@ -446,7 +513,7 @@ def process_epub_html(epub_in: str, epub_out: str, log_path: str = ""):
                                 )
                                 a = s.new_tag(
                                     "a",
-                                                                        attrs={
+                                    attrs={
                                         "id": ref_id,
                                         "href": href,
                                         "epub:type": "noteref",
@@ -476,7 +543,37 @@ def process_epub_html(epub_in: str, epub_out: str, log_path: str = ""):
                         if cleaned_nxt != str(nxt):
                             nxt.replace_with(NavigableString(cleaned_nxt))
 
-        # --- PHASE 3: Footnote Reinjection ---
+        # --- PHASE 3: Footnote Reinjection & Telemetry ---
+        linked_count = 0
+        unlinked_count = 0
+        for num_key, fn_data in sorted(g_notes.items(), key=lambda kv: int(kv[0])):
+            if fn_data["refs"]:
+                linked_count += 1
+                fn_samples = [s for s in stats.samples if s.category == "footnote_linking"]
+                if len(fn_samples) < 4:
+                    src_pages, blk_ids = (
+                        provenance.resolve(fn_data["text"]) if provenance is not None else ([], [])
+                    )
+                    stats.samples.append(
+                        TransformationSample(
+                            sample_id=f"fn-{num_key}",
+                            category="footnote_linking",
+                            source_pages=src_pages,
+                            block_ids=blk_ids,
+                            original_excerpt=f"Unlinked footer note {num_key}: {fn_data['text'][:180]}",
+                            restored_excerpt=(
+                                f"<li id='fn-{num_key}'><strong>[{num_key}]</strong> "
+                                f"{fn_data['text'][:180]} <a href='#{fn_data['refs'][0]['id']}'>↩</a></li>"
+                            ),
+                            description=f"Extracted footnote [{num_key}] and linked {len(fn_data['refs'])} bidirectional body reference(s).",
+                        )
+                    )
+            else:
+                unlinked_count += 1
+
+        stats.footnotes_linked = linked_count
+        stats.footnotes_unlinked = unlinked_count
+
         for fname, s in soups.items():
             file_notes = {k: v for k, v in g_notes.items() if v["file"] == fname}
             if file_notes:
@@ -520,3 +617,4 @@ def process_epub_html(epub_in: str, epub_out: str, log_path: str = ""):
         # --- Final Packaging (W3C EPUB 3.3 OCF Compliant) ---
         _package_epub(tmp_path, epub_out)
         log(f"✅ HTML modifications completed ({len(g_notes)} footnotes linked) and EPUB closed.")
+        return stats

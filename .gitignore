@@ -1,11 +1,14 @@
 # ==========================================
-# .gitignore para Ebook Restorer Pro
+# .gitignore for Lume
 # ==========================================
 
-# 1. Pastas de Saída e Processamento (NÃO subir PDFs ou Ebooks gerados)
+# 1. Local Test Books & Output Directories (Never commit books or generated e-books)
+books_test/
+book_test/
 Restored_Output/
 workdir/
 marker_input/
+comparison_assets/
 *.pdf
 *.epub
 *.azw3
@@ -14,22 +17,29 @@ marker_input/
 *.png
 *.log
 process_log.txt
+restoration_report.json
+comparison_report.html
 
-# 2. Arquivos de Cache do Python (Lixo de compilação)
+# 2. Python Bytecode & Test/Lint Caches
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 
-# 3. Ambientes Virtuais (Nunca se sobe o venv para o GitHub)
+# 3. Virtual Environments
 venv/
 .venv/
 env/
 
-# 4. Arquivos Temporários e de Sistema Operativo
+# 4. OS & Temporary Files
 .DS_Store
 Thumbs.db
 Desktop.ini
 
-# 5. Configurações de Editores de Código (VS Code, PyCharm, etc.)
+# 5. IDE Settings
 .vscode/
 .idea/

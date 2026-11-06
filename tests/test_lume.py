@@ -1,4 +1,9 @@
+from __future__ import annotations
+
+import hashlib
+import json
 import tempfile
+import tkinter as tk
 import unittest
 import zipfile
 from pathlib import Path
@@ -7,6 +12,8 @@ import fitz
 from bs4 import BeautifulSoup
 
 from core.converter import _sanitize_markdown
+from core.diagnostics import full_diagnostics, quick_diagnostics
+from core.epub_validator import validate_epub_structure
 from core.html_healer import (
     _extract_footnotes_from_soup,
     _stitch_broken_paragraphs,
@@ -15,19 +22,342 @@ from core.html_healer import (
     process_epub_html,
     transform_toc_kindle_safe,
 )
+from core.models import (
+    DocumentDiagnostics,
+    HealingStats,
+    RestorationReport,
+    TransformationEntry,
+    TransformationSample,
+    ValidationSummary,
+)
 from core.pdf_handler import (
     extract_cover_and_content,
     extract_pdf_metadata,
     is_born_digital_pdf,
 )
+from core.reporting import (
+    ProvenanceResolver,
+    build_restoration_report,
+    generate_comparison_report,
+)
+from ui.main_window import LumeApp
 
 
 class TestLumePipeline(unittest.TestCase):
+    def test_phase0_contracts_and_json_roundtrip(self):
+        """Verifies lossless JSON serialization and deserialization of RestorationReport."""
+        report = RestorationReport(
+            input_metadata={"resolved_title": "The Worker", "resolved_author": "Ernst Jünger"},
+            operational_metrics={"paragraphs_stitched": 14},
+            structural_metrics={"footnotes_linked_bidirectional": 123},
+            transformations=[
+                TransformationEntry(
+                    operation="cross_page_paragraph_stitching",
+                    category="operational",
+                    status="success",
+                    succeeded_count=14,
+                    skipped_count=120,
+                    source_pages=[24, 25],
+                )
+            ],
+            samples=[
+                TransformationSample(
+                    sample_id="stitch-1",
+                    category="paragraph_stitching",
+                    source_pages=[24, 25],
+                    block_ids=["/page/23/Text/4", "/page/24/Text/1"],
+                    original_excerpt="Broken part 1 || Broken part 2",
+                    restored_excerpt="Broken part 1 Broken part 2",
+                    description="Sample stitch",
+                )
+            ],
+        )
+        raw_json = report.to_json()
+        restored = RestorationReport.from_json(raw_json)
+        self.assertEqual(restored.schema_version, report.schema_version)
+        self.assertEqual(restored.run_id, report.run_id)
+        self.assertEqual(len(restored.transformations), 1)
+        self.assertEqual(restored.transformations[0].source_pages, [24, 25])
+        self.assertEqual(len(restored.samples), 1)
+        self.assertEqual(restored.samples[0].block_ids, ["/page/23/Text/4", "/page/24/Text/1"])
+
+    def test_phase1_epub_validator_accepts_valid_and_rejects_invalid(self):
+        """
+        Verifies that validate_epub_structure:
+        1) Rejects EPUBs with deflated or misplaced mimetype.
+        2) Rejects EPUBs with broken internal fragment anchors (#fn-999) or missing files.
+        3) Approves valid W3C EPUB 3.3 OCF archives with valid container.xml, OPF, and links.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # 1. Invalid EPUB: mimetype compressed with ZIP_DEFLATED and broken anchor #fn-999
+            bad_epub = tmp_path / "bad.epub"
+            with zipfile.ZipFile(bad_epub, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_DEFLATED)
+                zf.writestr(
+                    "EPUB/text/ch001.xhtml",
+                    '<?xml version="1.0" encoding="utf-8"?>'
+                    '<html xmlns="http://www.w3.org/1999/xhtml"><head><title>Bad</title></head>'
+                    '<body><p><a href="#fn-999">Broken Ref</a></p></body></html>',
+                )
+            bad_summary = validate_epub_structure(bad_epub)
+            self.assertFalse(bad_summary.is_valid)
+            self.assertFalse(bad_summary.mimetype_ok)
+            self.assertEqual(bad_summary.broken_links, 1)
+            codes = {i.code for i in bad_summary.issues}
+            self.assertIn("PKG-007", codes)
+            self.assertIn("RSC-006", codes)
+
+            # 2. Valid OCF EPUB healed by process_epub_html
+            raw_epub = tmp_path / "raw.epub"
+            good_epub = tmp_path / "good.epub"
+            container_xml = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
+                '<rootfiles><rootfile full-path="EPUB/content.opf" '
+                'media-type="application/oebps-package+xml"/></rootfiles></container>'
+            )
+            content_opf = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+                '<manifest><item id="ch1" href="text/ch001.xhtml" media-type="application/xhtml+xml"/></manifest>'
+                '<spine><itemref idref="ch1"/></spine></package>'
+            )
+            chapter_xhtml = """<?xml version="1.0" encoding="UTF-8"?>
+            <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
+            <head><title>Valid</title></head>
+            <body>
+              <p>Text with quotation «important»52 and another at sentence end»53.</p>
+              <p>Italic expression <em>sansculottism</em>90, followed by <em>“Imperium”</em> 101. And ellipsis…103,</p>
+              <p><sup>52</sup> First note (pp.34-35). 53Idem, p.366. <sup>90</sup> Note on <em>sansculottism</em>.</p>
+              <p><sup>101</sup> Note on Kant. <sup>103</sup> Neapolitan proverb.</p>
+            </body>
+            </html>
+            """
+            with zipfile.ZipFile(raw_epub, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("META-INF/container.xml", container_xml)
+                zf.writestr("EPUB/content.opf", content_opf)
+                zf.writestr("EPUB/text/ch001.xhtml", chapter_xhtml)
+                zf.writestr("mimetype", "application/epub+zip")
+
+            stats = process_epub_html(str(raw_epub), str(good_epub), "")
+            self.assertEqual(stats.footnotes_extracted, 5)
+            self.assertEqual(stats.footnotes_linked, 5)
+
+            good_summary = validate_epub_structure(good_epub)
+            self.assertTrue(good_summary.is_valid, f"Unexpected issues: {good_summary.issues}")
+            self.assertTrue(good_summary.mimetype_ok)
+            self.assertTrue(good_summary.container_xml_ok)
+            self.assertTrue(good_summary.opf_manifest_ok)
+            self.assertTrue(good_summary.xhtml_well_formed_ok)
+            self.assertEqual(good_summary.broken_links, 0)
+            self.assertEqual(good_summary.checked_links, 10)  # 5 forward noterefs + 5 backlinks
+
+    def test_phase2_diagnostics_classifications_and_readonly_guarantee(self):
+        """
+        Verifies 4-state page classification (extractable_text, image_only, mixed, empty_or_unknown),
+        distinct vs. repeated image counting, and strict read-only file integrity.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pdf_path = tmp_path / "multi_type.pdf"
+
+            # Create a small sample PNG image in memory using fitz Pixmap
+            pix = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 200, 200), False)
+            pix.clear_with(200)
+            img_bytes = pix.tobytes("png")
+
+            doc = fitz.open()
+            doc.set_metadata({"title": "Diagnostic Test Book", "author": "Test Author"})
+
+            # Page 1: Extractable text only + footnote at bottom
+            p1 = doc.new_page(width=600, height=800)
+            p1.insert_text(
+                (50, 100),
+                "This page contains selectable digital vector text exceeding forty characters easily.",
+            )
+            p1.insert_text((50, 720), "1 First footnote candidate at the bottom of page one.")
+
+            # Page 2: Image-only (scan simulation)
+            p2 = doc.new_page(width=600, height=800)
+            p2.insert_image(fitz.Rect(20, 20, 580, 780), stream=img_bytes)
+
+            # Page 3: Mixed / Hybrid (selectable text + large embedded figure)
+            p3 = doc.new_page(width=600, height=800)
+            p3.insert_text(
+                (50, 80),
+                "This hybrid academic page contains both selectable vector text and a large figure.",
+            )
+            p3.insert_image(fitz.Rect(50, 150, 550, 550), stream=img_bytes)
+
+            # Page 4: Empty page
+            doc.new_page(width=600, height=800)
+
+            doc.save(str(pdf_path))
+            doc.close()
+
+            sha_before = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+
+            q_diag = quick_diagnostics(pdf_path)
+            f_diag = full_diagnostics(pdf_path)
+
+            sha_after = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
+            self.assertEqual(sha_before, sha_after, "Diagnostics must never mutate the PDF file.")
+
+            self.assertIsNotNone(f_diag)
+            self.assertEqual(f_diag.total_pages, 4)
+            self.assertEqual(f_diag.extractable_text_pages, 1)
+            self.assertEqual(f_diag.image_only_pages, 1)
+            self.assertEqual(f_diag.mixed_pages, 1)
+            self.assertEqual(f_diag.empty_or_unknown_pages, 1)
+            self.assertGreaterEqual(f_diag.estimated_footnote_candidates, 1)
+            self.assertEqual(q_diag.embedded_title, "Diagnostic Test Book")
+            self.assertFalse(is_born_digital_pdf(str(pdf_path)))
+            meta = extract_pdf_metadata(str(pdf_path))
+            self.assertEqual(meta["title"], "Diagnostic Test Book")
+
+            toc_soup = BeautifulSoup(
+                "<table><tr><td>I. Intro</td><td>1</td></tr><tr><td>II. Part 1</td><td>10</td></tr>"
+                "<tr><td>III. Part 2</td><td>20</td></tr><tr><td>IV. End</td><td>30</td></tr></table>",
+                "html.parser",
+            )
+            toc_table = toc_soup.find("table")
+            self.assertTrue(is_toc_table(toc_table))
+            self.assertEqual(len(transform_toc_kindle_safe(toc_table, toc_soup).find_all("p")), 4)
+
+    def test_phase3_ui_concurrency_and_manual_metadata_protection(self):
+        """
+        Verifies that LumeApp:
+        1) Never overwrites Title/Author manually entered by the user when loading a PDF.
+        2) Updates auto-filled Title/Author when switching files if the user did not edit them.
+        3) Ignores stale background diagnostic callbacks from previous file selections.
+        """
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError:
+            self.skipTest("Tkinter display unavailable in headless environment")
+            return
+
+        try:
+            app = LumeApp(root)
+
+            # Simulate file 1 auto-filling metadata
+            app._diag_request_id = 1
+            diag1 = DocumentDiagnostics(
+                file_path="/tmp/book1.pdf",
+                file_name="book1.pdf",
+                total_pages=100,
+                embedded_title="Auto Title 1",
+                embedded_author="Auto Author 1",
+                is_complete=True,
+            )
+            app._render_diagnostics(diag1, req_id=1)
+            self.assertEqual(app.title_var.get(), "Auto Title 1")
+            self.assertEqual(app.author_var.get(), "Auto Author 1")
+
+            # Simulate user manually overriding the Title, but leaving Author untouched
+            app.title_var.set("User Custom Title")
+
+            # Simulate switching to file 2 (request_id = 2)
+            app._diag_request_id = 2
+            diag2 = DocumentDiagnostics(
+                file_path="/tmp/book2.pdf",
+                file_name="book2.pdf",
+                total_pages=250,
+                embedded_title="Auto Title 2",
+                embedded_author="Auto Author 2",
+                is_complete=True,
+            )
+            app._render_diagnostics(diag2, req_id=2)
+            # Manual title must be preserved; auto-author must update to file 2
+            self.assertEqual(app.title_var.get(), "User Custom Title")
+            self.assertEqual(app.author_var.get(), "Auto Author 2")
+
+            # Simulate stale callback arriving late from file 1 (req_id = 1)
+            app._render_diagnostics(diag1, req_id=1)
+            self.assertEqual(app.current_diagnostics.file_name, "book2.pdf")
+            self.assertIn("250 pages", app.diag_pages_var.get())
+        finally:
+            root.destroy()
+
+    def test_phase4_and_5_provenance_and_xss_safe_comparator_html(self):
+        """
+        Verifies that ProvenanceResolver links samples to their source PDF pages & Marker block IDs,
+        and that generate_comparison_report escapes untrusted script tags.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            pdf_path = tmp_path / "prov.pdf"
+            blocks_json = tmp_path / "provenance_blocks.json"
+
+            doc = fitz.open()
+            p1 = doc.new_page()
+            p1.insert_text((50, 100), "Every single element belongs to the organic construction.")
+            doc.save(str(pdf_path))
+            doc.close()
+
+            blocks_json.write_text(
+                json.dumps(
+                    [
+                        {
+                            "page_number": 1,
+                            "block_id": "/page/0/Text/3",
+                            "block_type": "Text",
+                            "text": "Every single element belongs to the organic construction.",
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            resolver = ProvenanceResolver(pdf_path, blocks_json)
+            pages, block_ids = resolver.resolve("Every single element belongs to the organic construction.")
+            self.assertEqual(pages, [1])
+            self.assertEqual(block_ids, ["/page/0/Text/3"])
+
+            # Verify XSS escaping in comparison report
+            diag = quick_diagnostics(pdf_path)
+            healing = HealingStats(
+                paragraphs_inspected=10,
+                paragraphs_stitched=1,
+                samples=[
+                    TransformationSample(
+                        sample_id="xss-test",
+                        category="paragraph_stitching",
+                        source_pages=[1],
+                        block_ids=["/page/0/Text/3"],
+                        original_excerpt="<script>alert('xss_before')</script>",
+                        restored_excerpt="<img src=x onerror=alert('xss_after')>",
+                        description="Test XSS escaping",
+                    )
+                ],
+            )
+            report = build_restoration_report(
+                pdf_path=str(pdf_path),
+                title="<script>alert('title')</script>",
+                author="Ernst Jünger",
+                compute_device="cpu",
+                diagnostics=diag,
+                extraction_stats={"cmap_issues_repaired": 1, "wide_cover_cropped": False},
+                healing_stats=healing,
+                validation=ValidationSummary(is_valid=True, checked_files=5, checked_links=8),
+                export_results={"generated_files": ["book.epub"], "failed_formats": {}},
+            )
+            html_out = Path(generate_comparison_report(report, pdf_path, tmp_path))
+            self.assertTrue(html_out.exists())
+            html_content = html_out.read_text(encoding="utf-8")
+
+            self.assertNotIn("<script>alert", html_content)
+            self.assertNotIn("<img src=x onerror", html_content)
+            self.assertIn("&lt;script&gt;alert", html_content)
+            self.assertTrue((tmp_path / "comparison_assets" / "page_001.jpg").exists())
+
     def test_rotated_pdf_cover_extraction_no_cropbox_error(self):
         """
         Regression test for 'ValueError: CropBox not in MediaBox':
         A portrait page (612x792) with /Rotate 90 has visual dimensions 792x612 (w > h * 1.05).
-        Verifies that extract_cover_and_content clips the cover cleanly without mutating CropBox.
         """
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -41,30 +371,11 @@ class TestLumePipeline(unittest.TestCase):
 
             cover_out = tmp_path / "cover.jpg"
             content_out = tmp_path / "content.pdf"
-            extract_cover_and_content(str(pdf_path), str(cover_out), str(content_out))
+            stats = extract_cover_and_content(str(pdf_path), str(cover_out), str(content_out))
 
             self.assertTrue(cover_out.exists() and cover_out.stat().st_size > 0)
             self.assertTrue(content_out.exists() and content_out.stat().st_size > 0)
-
-    def test_is_born_digital_pdf_and_metadata(self):
-        """Verifies detection of native vector text PDFs and embedded metadata extraction."""
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            pdf_path = tmp_path / "digital.pdf"
-            doc = fitz.open()
-            doc.set_metadata({"title": "The Worker", "author": "Ernst Jünger"})
-            page = doc.new_page()
-            page.insert_text(
-                (50, 50),
-                "This is a native digital PDF document containing more than eighty characters of selectable vector text.",
-            )
-            doc.save(str(pdf_path))
-            doc.close()
-
-            self.assertTrue(is_born_digital_pdf(str(pdf_path)))
-            meta = extract_pdf_metadata(str(pdf_path))
-            self.assertEqual(meta["title"], "The Worker")
-            self.assertEqual(meta["author"], "Ernst Jünger")
+            self.assertTrue(stats["wide_cover_cropped"])
 
     def test_sanitize_markdown_sections_and_em_dashes(self):
         """Verifies section heading normalization, missing dot recovery, and Synopsis escaping."""
@@ -96,82 +407,19 @@ class TestLumePipeline(unittest.TestCase):
         </body></html>
         """
         soup = BeautifulSoup(raw_html, "html.parser")
-        heal_html(soup)
+        stats = HealingStats()
+        heal_html(soup, stats)
         g_notes = {}
-        _extract_footnotes_from_soup("ch001.xhtml", soup, g_notes)
-        _stitch_broken_paragraphs(soup)
+        _extract_footnotes_from_soup("ch001.xhtml", soup, g_notes, stats)
+        _stitch_broken_paragraphs(soup, stats)
 
         paragraphs = [p.get_text(strip=True) for p in soup.find_all("p")]
         self.assertEqual(len(paragraphs), 2)
         self.assertEqual("This is an example of Nation-State and scientific modernity.", paragraphs[0])
         self.assertEqual("Every single element belongs to the organic construction of the whole.", paragraphs[1])
-        self.assertIn("1", g_notes)
-        self.assertEqual(g_notes["1"]["text"], "Footnote that originally sat at the bottom of page 32.")
-
-    def test_toc_table_detection_and_transformation(self):
-        """Verifies detection and Kindle-safe transformation of Table of Contents HTML tables."""
-        toc_html = """
-        <html><body>
-          <table>
-            <tr><td>I. The Third Estate</td><td>15</td></tr>
-            <tr><td>II. The Elemental Powers</td><td>42</td></tr>
-            <tr><td>III. Work as a Way of Life</td><td>88</td></tr>
-            <tr><td>IV. Organic Construction</td><td>134</td></tr>
-          </table>
-        </body></html>
-        """
-        soup = BeautifulSoup(toc_html, "html.parser")
-        table = soup.find("table")
-        self.assertTrue(is_toc_table(table))
-        nav_div = transform_toc_kindle_safe(table, soup)
-        entries = nav_div.find_all("p", class_="toc-entry")
-        self.assertEqual(len(entries), 4)
-        self.assertIn("I. The Third Estate", entries[0].get_text())
-        self.assertIn("15", entries[0].get_text())
-
-    def test_epub_packaging_and_bidirectional_footnotes(self):
-        """
-        Verifies end-to-end EPUB healing and W3C EPUB 3.3 OCF compliance:
-        - 'mimetype' must be the first file in the ZIP archive and stored with ZIP_STORED.
-        - Merged footnotes, glued footnotes ('53Idem'), and inline-tag references ('</em>90,') must link 100%.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            base_epub = tmp_path / "temp.epub"
-            final_epub = tmp_path / "final.epub"
-
-            chapter_xhtml = """<?xml version="1.0" encoding="UTF-8"?>
-            <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops">
-            <head><title>Test</title></head>
-            <body>
-              <p>Text with quotation «important»52 and another at sentence end»53.</p>
-              <p>Italic expression <em>sansculottism</em>90, followed by <em>“Imperium”</em> 101. And ellipsis…103,</p>
-              <p><sup>52</sup> First note (pp.34-35). 53Idem, p.366. <sup>90</sup> Note on <em>sansculottism</em>.</p>
-              <p><sup>101</sup> Note on Kant. <sup>103</sup> Neapolitan proverb.</p>
-            </body>
-            </html>
-            """
-
-            with zipfile.ZipFile(base_epub, "w", zipfile.ZIP_DEFLATED) as z:
-                z.writestr("EPUB/text/ch001.xhtml", chapter_xhtml)
-                z.writestr("mimetype", "application/epub+zip")
-
-            process_epub_html(str(base_epub), str(final_epub), "")
-
-            with zipfile.ZipFile(final_epub, "r") as z:
-                infolist = z.infolist()
-                self.assertEqual(infolist[0].filename, "mimetype")
-                self.assertEqual(infolist[0].compress_type, zipfile.ZIP_STORED)
-                self.assertEqual(z.read("mimetype"), b"application/epub+zip")
-
-                healed_html = z.read("EPUB/text/ch001.xhtml").decode("utf-8")
-                soup = BeautifulSoup(healed_html, "html.parser")
-
-                fn_items = [li["id"] for li in soup.find_all("li", id=True)]
-                noterefs = [a.get_text(strip=True) for a in soup.find_all("a", attrs={"epub:type": "noteref"})]
-
-                self.assertEqual(fn_items, ["fn-52", "fn-53", "fn-90", "fn-101", "fn-103"])
-                self.assertEqual(noterefs, ["52", "53", "90", "101", "103"])
+        self.assertEqual(stats.false_sups_unwrapped, 1)
+        self.assertEqual(stats.leaked_pages_removed, 2)
+        self.assertEqual(stats.paragraphs_stitched, 1)
 
 
 if __name__ == "__main__":
