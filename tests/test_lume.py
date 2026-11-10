@@ -499,12 +499,13 @@ class TestLumePipeline(unittest.TestCase):
                 extraction_stats={},
                 healing_stats=HealingStats(paragraphs_inspected=5, paragraphs_stitched=1),
                 validation=ValidationSummary(is_valid=True),
-                export_results={},
+                export_results={"generated_files": [str(tmp_path / "Privacy_Test.epub")]},
             )
             report_dict = json.loads(report.to_json())
             self.assertEqual(report_dict["input_metadata"].get("source_file"), "short_repeated.pdf")
             self.assertNotIn("source_pdf", report_dict["input_metadata"])
             self.assertNotIn("file_path", report_dict["diagnostics"])
+            self.assertEqual(report_dict["export_results"].get("generated_files"), ["Privacy_Test.epub"])
 
 
 if __name__ == "__main__":

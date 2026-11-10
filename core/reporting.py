@@ -221,6 +221,12 @@ def build_restoration_report(
     if include_full_paths:
         input_metadata["source_pdf"] = os.path.abspath(pdf_path)
 
+    sanitized_export_results = dict(export_results or {})
+    if not include_full_paths and "generated_files" in sanitized_export_results:
+        sanitized_export_results["generated_files"] = [
+            os.path.basename(str(p)) for p in (sanitized_export_results.get("generated_files") or [])
+        ]
+
     return RestorationReport(
         input_metadata=input_metadata,
         environment=collect_runtime_environment(compute_device),
@@ -230,7 +236,7 @@ def build_restoration_report(
         transformations=transformations,
         samples=healing_stats.samples[:8],
         validation=validation.to_dict(),
-        export_results=export_results,
+        export_results=sanitized_export_results,
     )
 
 
